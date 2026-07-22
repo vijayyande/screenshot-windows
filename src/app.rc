@@ -1,0 +1,128 @@
+#include "resource.h"
+#include <windows.h>
+#include <commctrl.h>
+
+#define RT_RCDATA MAKEINTRESOURCE(256)
+
+IDI_APPICON ICON "app.ico"
+
+// Menu definitions
+IDR_MAIN_MENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "Ctrl+N",                    IDM_FILE_NEW
+        MENUITEM "Ctrl+O",                    IDM_FILE_OPEN
+        MENUITEM "Ctrl+S",                    IDM_FILE_SAVE
+        MENUITEM "Ctrl+Shift+S",              IDM_FILE_SAVEAS
+        MENUITEM SEPARATOR
+        MENUITEM "Close Tab",                 IDM_FILE_CLOSE_TAB
+        MENUITEM SEPARATOR
+        MENUITEM "Alt+F4",                    IDM_FILE_EXIT
+    END
+    POPUP "&Edit"
+    BEGIN
+        MENUITEM "Ctrl+Z",                    IDM_EDIT_UNDO
+        MENUITEM "Ctrl+Y",                    IDM_EDIT_REDO
+        MENUITEM SEPARATOR
+        MENUITEM "Ctrl+C",                    IDM_EDIT_COPY
+        MENUITEM "Ctrl+V",                    IDM_EDIT_PASTE
+        MENUITEM SEPARATOR
+        MENUITEM "Del",                       IDM_EDIT_CLEAR
+        MENUITEM "Ctrl+R",                    IDM_EDIT_CROP
+        MENUITEM "Ctrl+Shift+R",              IDM_EDIT_RESIZE
+    END
+    POPUP "&Capture"
+    BEGIN
+        MENUITEM "Fullscreen (F11)",          IDM_CAPTURE_FULLSCREEN
+        MENUITEM "Region (F12)",              IDM_CAPTURE_REGION
+    END
+    POPUP "&Tools"
+    BEGIN
+        MENUITEM "Pen",                       IDM_TOOL_PEN
+        MENUITEM "Line",                      IDM_TOOL_LINE
+        MENUITEM "Rectangle",                 IDM_TOOL_RECT
+        MENUITEM "Ellipse",                   IDM_TOOL_ELLIPSE
+        MENUITEM "Arrow",                     IDM_TOOL_ARROW
+        MENUITEM "Eraser",                    IDM_TOOL_ERASER
+        MENUITEM SEPARATOR
+        MENUITEM "Fill",                      IDM_TOOL_FILL
+        MENUITEM "Text",                      IDM_TOOL_TEXT
+    END
+    POPUP "&Color"
+    BEGIN
+        MENUITEM "Black",                     IDM_COLOR_BLACK
+        MENUITEM "Red",                       IDM_COLOR_RED
+        MENUITEM "Green",                     IDM_COLOR_GREEN
+        MENUITEM "Blue",                      IDM_COLOR_BLUE
+        MENUITEM "Yellow",                    IDM_COLOR_YELLOW
+        MENUITEM SEPARATOR
+        MENUITEM "Custom...",                 IDM_COLOR_CUSTOM
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "Zoom In (Ctrl+)",           IDM_VIEW_ZOOM_IN
+        MENUITEM "Zoom Out (Ctrl-)",          IDM_VIEW_ZOOM_OUT
+        MENUITEM "Actual Size (Ctrl+0)",      IDM_VIEW_ZOOM_100
+        MENUITEM SEPARATOR
+        MENUITEM "Fit to Window",             IDM_VIEW_FIT
+    END
+    POPUP "&Help"
+    BEGIN
+        MENUITEM "About",                     IDM_HELP_ABOUT
+    END
+END
+
+// Dialog definitions
+IDD_ABOUT DIALOGEX 0, 0, 300, 160
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About Screenshot Editor"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Screenshot Editor v1.0", IDC_STATIC, 20, 20, 260, 12
+    LTEXT           "A Windows screenshot capture and image editing tool.", IDC_STATIC, 20, 40, 260, 12
+    LTEXT           "Features: Screenshot capture, drawing, painting,", IDC_STATIC, 20, 60, 260, 12
+    LTEXT           "pen width/color adjustment, shape tools.", IDC_STATIC, 20, 75, 260, 12
+    DEFPUSHBUTTON   "OK", IDOK, 110, 130, 80, 20
+END
+
+IDD_RESIZE DIALOGEX 0, 0, 230, 150
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Resize Image"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Width:",     IDC_STATIC, 15, 15,  40, 12
+    EDITTEXT        101,          55, 13,    60, 14, ES_AUTOHSCROLL
+    LTEXT           "Height:",    IDC_STATIC, 15, 35,  40, 12
+    EDITTEXT        102,          55, 33,    60, 14, ES_AUTOHSCROLL
+    AUTOCHECKBOX    "Keep aspect ratio", 103, 15, 55, 100, 12
+    AUTOCHECKBOX    "Percentage", 104, 15, 72, 80, 12
+    DEFPUSHBUTTON   "OK",     IDOK,  50, 100, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 125, 100, 50, 14
+END
+
+IDD_PEN_WIDTH DIALOGEX 0, 0, 200, 100
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Pen Settings"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Pen Width (1-50):", IDC_STATIC, 15, 20, 80, 12
+    EDITTEXT        201,       100, 18, 50, 14, ES_AUTOHSCROLL | ES_NUMBER
+    DEFPUSHBUTTON   "OK",     IDOK,  40, 75, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 110, 75, 50, 14
+END
+
+IDD_FONT DIALOGEX 0, 0, 220, 160
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Text Settings"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Text:",    IDC_STATIC, 15, 12, 40, 12
+    EDITTEXT        300,        55, 10, 150, 14, ES_AUTOHSCROLL
+    LTEXT           "Font:",    IDC_STATIC, 15, 35, 40, 12
+    COMBOBOX        301,        55, 33, 150, 120, CBS_DROPDOWN | CBS_SORT | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Size:",    IDC_STATIC, 15, 58, 40, 12
+    EDITTEXT        302,        55, 56, 50, 14, ES_AUTOHSCROLL | ES_NUMBER
+    DEFPUSHBUTTON   "OK",     IDOK,  50, 110, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 120, 110, 50, 14
+END
