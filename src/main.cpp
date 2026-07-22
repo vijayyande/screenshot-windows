@@ -10,6 +10,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <dwmapi.h>
 #include <gdiplus.h>
 #include <vector>
 #include <string>
@@ -18,6 +19,7 @@
 #include "resource.h"
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
 
 using namespace Gdiplus;
@@ -350,6 +352,14 @@ static HBITMAP CaptureScreen() {
     DeleteDC(hdc);
     ReleaseDC(nullptr, hScr);
     return hBmp;
+}
+
+static void HideAndCapture(HWND hwnd) {
+    ShowWindow(hwnd, SW_MINIMIZE);
+    RedrawWindow(nullptr, nullptr, nullptr,
+        RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE);
+    DwmFlush();
+    Sleep(50);
 }
 
 static HBITMAP CaptureRegion(int x, int y, int w, int h) {
@@ -2362,8 +2372,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case IDM_CAPTURE_FULLSCREEN: {
             FlattenToBitmap();
-            ShowWindow(hwnd, SW_HIDE);
-            Sleep(200);
+            HideAndCapture(hwnd);
             HBITMAP hb = CaptureScreen();
             int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             int ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
@@ -2377,8 +2386,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case IDM_CAPTURE_REGION: {
             FlattenToBitmap();
-            ShowWindow(hwnd, SW_HIDE);
-            Sleep(100);
+            HideAndCapture(hwnd);
             g_overlayVirtX = GetSystemMetrics(SM_XVIRTUALSCREEN);
             g_overlayVirtY = GetSystemMetrics(SM_YVIRTUALSCREEN);
             g_overlayScreenW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
