@@ -2182,6 +2182,27 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+static WNDPROC g_prevTabProc = nullptr;
+static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN) {
+        TCHITTESTINFO thti = {};
+        thti.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = (int)SendMessage(hwnd, TCM_HITTEST, 0, (LPARAM)&thti);
+        if (idx >= 0 && idx < (int)g.tabs.size()) {
+            RECT tabRc = {};
+            TabCtrl_GetItemRect(hwnd, idx, &tabRc);
+            int closeW = 16;
+            int closeX = tabRc.right - closeW;
+            POINT clickPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (clickPt.x >= closeX && clickPt.x <= tabRc.right) {
+                CloseTab(idx);
+                return 0;
+            }
+        }
+    }
+    return CallWindowProc(g_prevTabProc, hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     switch (msg) {
@@ -2194,9 +2215,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)IDC_STATUSBAR, nullptr, nullptr);
 
         g.hwndTab = CreateWindowEx(0, WC_TABCONTROL, nullptr,
-            WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH | TCS_FORCELABELLEFT,
+            WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH | TCS_FORCELABELLEFT | TCS_OWNERDRAWFIXED,
             0, 0, 0, 0, hwnd, (HMENU)IDC_TAB, nullptr, nullptr);
         SendMessage(g.hwndTab, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), 0);
+        RECT tabRc = {};
+        SendMessage(g.hwndTab, TCM_ADJUSTRECT, FALSE, (LPARAM)&tabRc);
+        int tabH = 24;
+        SendMessage(g.hwndTab, TCM_SETITEMSIZE, 0, MAKELPARAM(120, tabH));
+        g_prevTabProc = (WNDPROC)SetWindowLongPtr(g.hwndTab, GWLP_WNDPROC, (LONG_PTR)TabSubclassProc);
 
         g.hwndCanvas = CreateWindowEx(0, L"Static", nullptr,
             WS_CHILD | WS_VISIBLE | SS_NOTIFY,
@@ -2462,6 +2488,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (ctrl && wp == 'N') { SendMessage(hwnd, WM_COMMAND, IDM_FILE_NEW, 0); return 0; }
         if (ctrl && wp == 'O') { SendMessage(hwnd, WM_COMMAND, IDM_FILE_OPEN, 0); return 0; }
         if (ctrl && wp == 'S') { SendMessage(hwnd, WM_COMMAND, IDM_FILE_SAVE, 0); return 0; }
+        if (ctrl && wp == 'W') { SendMessage(hwnd, WM_COMMAND, IDM_FILE_CLOSE_TAB, 0); return 0; }
         if (ctrl && wp == 'C') { SendMessage(hwnd, WM_COMMAND, IDM_EDIT_COPY, 0); return 0; }
         if (ctrl && wp == 'V') { SendMessage(hwnd, WM_COMMAND, IDM_EDIT_PASTE, 0); return 0; }
         if (wp == VK_F11) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_FULLSCREEN, 0); return 0; }
@@ -2529,6 +2556,60 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TrackPopupMenu(hm, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
         DestroyMenu(hm);
         return 0;
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* ds = (DRAWITEMSTRUCT*)lp;
+        if (ds->CtlType == ODT_TAB && ds->CtlID == IDC_TAB) {
+            HDC hdc = ds->hDC;
+            RECT rc = ds->rcItem;
+            bool selected = (ds->itemState & ODS_SELECTED);
+
+            int idx = (int)ds->itemID;
+            wchar_t label[64] = {};
+            TCITEM tie = {};
+            tie.mask = TCIF_TEXT;
+            tie.pszText = label;
+            tie.cchTextMax = _countof(label);
+            TabCtrl_GetItem(g.hwndTab, idx, &tie);
+
+            HBRUSH bgBr = CreateSolidBrush(selected ? RGB(45, 45, 48) : RGB(37, 37, 38));
+            FillRect(hdc, &rc, bgBr);
+            DeleteObject(bgBr);
+
+            HPEN linePen = CreatePen(PS_SOLID, 1, RGB(55, 55, 55));
+            HPEN oldPen = (HPEN)SelectObject(hdc, linePen);
+            MoveToEx(hdc, rc.left, rc.bottom - 1, nullptr);
+            LineTo(hdc, rc.right, rc.bottom - 1);
+            SelectObject(hdc, oldPen);
+            DeleteObject(linePen);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, selected ? RGB(255, 255, 255) : RGB(180, 180, 180));
+            HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT oldFont = (HFONT)SelectObject(hdc, hf);
+
+            int pad = 8;
+            int closeW = 16;
+            RECT textRc = { rc.left + pad, rc.top, rc.right - closeW - pad, rc.bottom };
+            DrawText(hdc, label, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            int closeSize = 7;
+            int cx = rc.right - closeW / 2;
+            int cy = (rc.top + rc.bottom) / 2;
+            HPEN closePen = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
+            SelectObject(hdc, closePen);
+            MoveToEx(hdc, cx - closeSize, cy - closeSize, nullptr);
+            LineTo(hdc, cx + closeSize, cy + closeSize);
+            MoveToEx(hdc, cx + closeSize, cy - closeSize, nullptr);
+            LineTo(hdc, cx - closeSize, cy + closeSize);
+            SelectObject(hdc, oldPen);
+            DeleteObject(closePen);
+            SelectObject(hdc, oldFont);
+
+            return TRUE;
+        }
+        break;
     }
 
     case WM_NOTIFY: {
