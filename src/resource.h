@@ -53,9 +53,20 @@
 
 #define IDM_HELP_ABOUT       2601
 
+#define IDM_CAPTURE_MON1     2701
+#define IDM_CAPTURE_MON2     2702
+#define IDM_CAPTURE_MON3     2703
+#define IDM_CAPTURE_MON4     2704
+#define IDM_CAPTURE_MON5     2705
+#define IDM_CAPTURE_MON6     2706
+#define IDM_CAPTURE_MON7     2707
+#define IDM_CAPTURE_MON8     2708
+#define IDM_CAPTURE_MON_ALL  2710
+
 #define IDC_STATIC          -1
 
 #define IDC_TAB             1008
+#define IDC_TAB_CLOSE       1009
 
 #define IDM_FILE_CLOSE_TAB  2006
 

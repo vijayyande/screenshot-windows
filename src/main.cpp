@@ -60,6 +60,8 @@ struct TabData {
     std::wstring filename;
 };
 
+static const UINT WM_DEFER_FONTDLG = WM_APP + 1;
+
 struct App {
     Tool currentTool = Tool::Select;
     COLORREF penColor = RGB(240, 200, 0);
@@ -76,8 +78,9 @@ struct App {
     HWND hStatusbar = nullptr;
     HWND hwndTooltip = nullptr;
     HWND hwndTab = nullptr;
+    std::vector<HWND> tabCloseBtns;
 
-    int toolbarH = 44;
+    int toolbarH = 50;
     int tabH = 24;
     int hoverBtn = -1;
 
@@ -93,6 +96,8 @@ struct App {
     bool isCropping = false;
     POINT cropStart = {};
     POINT cropEnd = {};
+
+    HWND hwndFontDlg = nullptr;
 
     std::vector<TabData> tabs;
     int activeTab = -1;
@@ -140,6 +145,21 @@ static void GetBBox(const Stroke& s, POINT& tl, POINT& br) {
             tl.x = min(tl.x, s.points[i].x); tl.y = min(tl.y, s.points[i].y);
             br.x = max(br.x, s.points[i].x); br.y = max(br.y, s.points[i].y);
         }
+    } else if (s.tool == Tool::Text) {
+        int fs = max(8, s.fontSize);
+        HDC hdc = CreateCompatibleDC(nullptr);
+        HFONT hf = CreateFont(-fs, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
+        HFONT old = (HFONT)SelectObject(hdc, hf);
+        SIZE sz = { 0, 0 };
+        if (!s.text.empty())
+            GetTextExtentPoint32(hdc, s.text.c_str(), (int)s.text.size(), &sz);
+        SelectObject(hdc, old);
+        DeleteObject(hf);
+        DeleteDC(hdc);
+        int pad = 6;
+        tl.x = s.startPt.x - pad; tl.y = s.startPt.y - fs - pad;
+        br.x = s.startPt.x + sz.cx + pad; br.y = s.startPt.y + pad;
     } else {
         tl.x = min(s.startPt.x, s.endPt.x); tl.y = min(s.startPt.y, s.endPt.y);
         br.x = max(s.startPt.x, s.endPt.x); br.y = max(s.startPt.y, s.endPt.y);
@@ -203,17 +223,9 @@ static int HitTestShape(POINT imgPt) {
             break;
         }
         case Tool::Text: {
-            HDC hdc = CreateCompatibleDC(nullptr);
-            HFONT hf = CreateFont(-s.fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
-                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
-            HFONT old = (HFONT)SelectObject(hdc, hf);
-            SIZE sz;
-            GetTextExtentPoint32(hdc, s.text.c_str(), (int)s.text.size(), &sz);
-            SelectObject(hdc, old);
-            DeleteObject(hf);
-            DeleteDC(hdc);
-            RECT r = { s.startPt.x - 2, s.startPt.y - sz.cy - 2, s.startPt.x + sz.cx + 2, s.startPt.y + 2 };
-            if (imgPt.x >= r.left && imgPt.x <= r.right && imgPt.y >= r.top && imgPt.y <= r.bottom)
+            POINT tl, br;
+            GetBBox(s, tl, br);
+            if (imgPt.x >= tl.x && imgPt.x <= br.x && imgPt.y >= tl.y && imgPt.y <= br.y)
                 return i;
             break;
         }
@@ -225,14 +237,16 @@ static int HitTestShape(POINT imgPt) {
             HFONT hf = CreateFont(-s.fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
             HFONT old = (HFONT)SelectObject(hdc, hf);
-            SIZE tsz;
-            GetTextExtentPoint32(hdc, s.text.c_str(), (int)s.text.size(), &tsz);
+            int pad = 6;
+            int maxBubbleW = 300;
+            RECT rcCalc = { 0, 0, maxBubbleW, 10000 };
+            if (!s.text.empty())
+                DrawText(hdc, s.text.c_str(), (int)s.text.size(), &rcCalc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
             SelectObject(hdc, old);
             DeleteObject(hf);
             DeleteDC(hdc);
-            int pad = 6;
-            int bw = tsz.cx + pad * 2;
-            int bh = tsz.cy + pad * 2;
+            int bw = rcCalc.right + pad * 2;
+            int bh = rcCalc.bottom + pad * 2;
             RECT br2 = { s.endPt.x - bw / 2 - 2, s.endPt.y - bh / 2 - 2,
                          s.endPt.x + bw / 2 + 2, s.endPt.y + bh / 2 + 2 };
             if (imgPt.x >= br2.left && imgPt.x <= br2.right && imgPt.y >= br2.top && imgPt.y <= br2.bottom)
@@ -307,6 +321,11 @@ static void ResizeStroke(int idx, int handle, POINT newImgPt) {
             s.points[i].x = newTl.x + (int)((bak.points[i].x - origTl.x) * sx);
             s.points[i].y = newTl.y + (int)((bak.points[i].y - origTl.y) * sy);
         }
+    } else if (s.tool == Tool::Text) {
+        int dx = newTl.x - origTl.x;
+        int dy = newTl.y - origTl.y;
+        s.startPt.x = bak.startPt.x + dx;
+        s.startPt.y = bak.startPt.y + dy;
     } else {
         s.startPt.x = newTl.x + (int)((bak.startPt.x - origTl.x) * sx);
         s.startPt.y = newTl.y + (int)((bak.startPt.y - origTl.y) * sy);
@@ -346,9 +365,18 @@ static HBITMAP CaptureScreen() {
     int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     HDC hScr = GetDC(nullptr);
     HDC hdc = CreateCompatibleDC(hScr);
-    HBITMAP hBmp = CreateCompatibleBitmap(hScr, vw, vh);
-    SelectObject(hdc, hBmp);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = vw;
+    bmi.bmiHeader.biHeight = -vh;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* pvBits = nullptr;
+    HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+    HGDIOBJ old = SelectObject(hdc, hBmp);
     BitBlt(hdc, 0, 0, vw, vh, hScr, vx, vy, SRCCOPY);
+    SelectObject(hdc, old);
     DeleteDC(hdc);
     ReleaseDC(nullptr, hScr);
     return hBmp;
@@ -365,9 +393,18 @@ static void HideAndCapture(HWND hwnd) {
 static HBITMAP CaptureRegion(int x, int y, int w, int h) {
     HDC hScr = GetDC(nullptr);
     HDC hdc = CreateCompatibleDC(hScr);
-    HBITMAP hBmp = CreateCompatibleBitmap(hScr, w, h);
-    SelectObject(hdc, hBmp);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* pvBits = nullptr;
+    HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+    HGDIOBJ old = SelectObject(hdc, hBmp);
     BitBlt(hdc, 0, 0, w, h, hScr, x, y, SRCCOPY);
+    SelectObject(hdc, old);
     DeleteDC(hdc);
     ReleaseDC(nullptr, hScr);
     return hBmp;
@@ -511,6 +548,81 @@ static void FlattenToBitmap() {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, s.color);
             TextOut(hdc, s.startPt.x, s.startPt.y - fs, s.text.c_str(), (int)s.text.size());
+            SelectObject(hdc, hof);
+            DeleteObject(hf);
+            break;
+        }
+        case Tool::Callout: {
+            DeleteObject(hPen);
+            hPen = nullptr;
+            int fs = max(8, s.fontSize);
+            HFONT hf = CreateFont(-fs, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
+            HFONT hof = (HFONT)SelectObject(hdc, hf);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, s.color);
+            int pad = 6;
+            int maxBubbleW = 300;
+            RECT rcCalc = { 0, 0, maxBubbleW, 10000 };
+            if (!s.text.empty())
+                DrawText(hdc, s.text.c_str(), (int)s.text.size(), &rcCalc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
+            int bw = rcCalc.right + pad * 2;
+            int bh = rcCalc.bottom + pad * 2;
+            int bx = s.endPt.x - bw / 2;
+            int by = s.endPt.y - bh / 2;
+            HBRUSH bgBr = CreateSolidBrush(RGB(255, 255, 255));
+            HPEN borderPen = CreatePen(PS_SOLID, max(1, s.penWidth), s.color);
+            HBRUSH ob2 = (HBRUSH)SelectObject(hdc, bgBr);
+            HPEN op2 = (HPEN)SelectObject(hdc, borderPen);
+            RoundRect(hdc, bx, by, bx + bw, by + bh, 8, 8);
+            SelectObject(hdc, ob2);
+            SelectObject(hdc, op2);
+            DeleteObject(bgBr);
+            DeleteObject(borderPen);
+            RECT rcTxt = { bx + pad, by + pad, bx + bw - pad, by + bh - pad };
+            if (!s.text.empty())
+                DrawText(hdc, s.text.c_str(), (int)s.text.size(), &rcTxt, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            double acx = (double)s.endPt.x, acy = (double)s.endPt.y;
+            double atx = (double)s.startPt.x, aty = (double)s.startPt.y;
+            double ang = atan2(aty - acy, atx - acx);
+            double adx = cos(ang), ady = sin(ang);
+            double ix = acx, iy = acy;
+            if (adx > 0) ix = bx + bw; else if (adx < 0) ix = bx;
+            if (ady > 0) iy = by + bh; else if (ady < 0) iy = by;
+            if (adx != 0) { double frac = (ix - acx) / adx; iy = acy + frac * ady; }
+            if (iy < by || iy > by + bh) {
+                if (ady > 0) iy = by + bh; else iy = by;
+                double frac = (iy - acy) / ady;
+                ix = acx + frac * adx;
+            }
+            HPEN arrPen = CreatePen(PS_SOLID, max(1, s.penWidth), s.color);
+            HPEN op3 = (HPEN)SelectObject(hdc, arrPen);
+            HBRUSH arrBr = CreateSolidBrush(s.color);
+            HBRUSH ob3 = (HBRUSH)SelectObject(hdc, arrBr);
+            POINT arrowTail = { (int)ix, (int)iy };
+            POINT arrowTip = { (int)atx, (int)aty };
+            double ddx = arrowTip.x - arrowTail.x, ddy = arrowTip.y - arrowTail.y;
+            double len = sqrt(ddx * ddx + ddy * ddy);
+            if (len > 1) {
+                double nx = ddx / len, ny = ddy / len;
+                double hl = max(8.0, 12.0);
+                double hw = hl * 0.5;
+                POINT pts[3] = {
+                    arrowTip,
+                    { (int)(arrowTip.x - nx * hl + ny * hw), (int)(arrowTip.y - ny * hl - nx * hw) },
+                    { (int)(arrowTip.x - nx * hl - ny * hw), (int)(arrowTip.y - ny * hl + nx * hw) }
+                };
+                Polygon(hdc, pts, 3);
+                double shaftLen = len - hl * 0.3;
+                if (shaftLen > 0) {
+                    MoveToEx(hdc, (int)arrowTail.x, (int)arrowTail.y, nullptr);
+                    LineTo(hdc, (int)(arrowTail.x + nx * shaftLen), (int)(arrowTail.y + ny * shaftLen));
+                }
+            }
+            SelectObject(hdc, op3);
+            SelectObject(hdc, ob3);
+            DeleteObject(arrPen);
+            DeleteObject(arrBr);
             SelectObject(hdc, hof);
             DeleteObject(hf);
             break;
@@ -724,59 +836,77 @@ static void ShowAboutDlg(HWND parent) {
         });
 }
 
+static INT_PTR CALLBACK FontDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_INITDIALOG) {
+        TabData* t = (TabData*)lp;
+        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)lp);
+        SetDlgItemText(hDlg, 300, t->strokes[t->selIdx].text.c_str());
+        HWND hCombo = GetDlgItem(hDlg, 301);
+        HDC hdc = GetDC(nullptr);
+        EnumFontFamilies(hdc, nullptr, [](const LOGFONT* lplf, const TEXTMETRIC*, DWORD, LPARAM lParam) -> int {
+            SendMessage((HWND)lParam, CB_ADDSTRING, 0, (LPARAM)lplf->lfFaceName);
+            return 1;
+        }, (LPARAM)hCombo);
+        ReleaseDC(nullptr, hdc);
+        int idx = (int)SendMessage(hCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)t->strokes[t->selIdx].fontName.c_str());
+        if (idx == CB_ERR) idx = 0;
+        SendMessage(hCombo, CB_SETCURSEL, idx, 0);
+        wchar_t buf[16];
+        swprintf_s(buf, L"%d", t->strokes[t->selIdx].fontSize);
+        SetDlgItemText(hDlg, 302, buf);
+        return TRUE;
+    }
+    if (msg == WM_COMMAND && LOWORD(wp) == IDOK) {
+        TabData* t = (TabData*)GetWindowLongPtr(hDlg, DWLP_USER);
+        if (t && t->selIdx >= 0 && t->selIdx < (int)t->strokes.size()) {
+            wchar_t txt[256];
+            GetDlgItemText(hDlg, 300, txt, 256);
+            HWND hCombo = GetDlgItem(hDlg, 301);
+            int idx = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+            wchar_t fn[LF_FACESIZE];
+            SendMessage(hCombo, CB_GETLBTEXT, idx, (LPARAM)fn);
+            wchar_t bf[16];
+            GetDlgItemText(hDlg, 302, bf, 16);
+            int sz = max(6, min(200, _wtoi(bf)));
+            auto& s = t->strokes[t->selIdx];
+            s.text = txt;
+            s.fontName = fn;
+            s.fontSize = sz;
+            g.fontName = fn;
+            g.fontSize = sz;
+        }
+        g.hwndFontDlg = nullptr;
+        DestroyWindow(hDlg);
+        InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+        return TRUE;
+    }
+    if (msg == WM_COMMAND && (LOWORD(wp) == IDCANCEL || LOWORD(wp) == 2)) {
+        g.hwndFontDlg = nullptr;
+        DestroyWindow(hDlg);
+        return TRUE;
+    }
+    if (msg == WM_CLOSE) {
+        g.hwndFontDlg = nullptr;
+        DestroyWindow(hDlg);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void ShowFontDlg() {
+    if (g.hwndFontDlg) {
+        SetForegroundWindow(g.hwndFontDlg);
+        return;
+    }
     TabData* t = ActiveTab();
     if (!t || t->selIdx < 0 || t->selIdx >= (int)t->strokes.size() ||
         (t->strokes[t->selIdx].tool != Tool::Text && t->strokes[t->selIdx].tool != Tool::Callout)) return;
-    DialogBoxParam(nullptr, MAKEINTRESOURCE(IDD_FONT), g.hwndMain,
-        [](HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) -> INT_PTR {
-            if (msg == WM_INITDIALOG) {
-                TabData* t = (TabData*)lp;
-                SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)lp);
-                SetDlgItemText(hDlg, 300, t->strokes[t->selIdx].text.c_str());
-                HWND hCombo = GetDlgItem(hDlg, 301);
-                HDC hdc = GetDC(nullptr);
-                EnumFontFamilies(hdc, nullptr, [](const LOGFONT* lplf, const TEXTMETRIC*, DWORD, LPARAM lParam) -> int {
-                    SendMessage((HWND)lParam, CB_ADDSTRING, 0, (LPARAM)lplf->lfFaceName);
-                    return 1;
-                }, (LPARAM)hCombo);
-                ReleaseDC(nullptr, hdc);
-                int idx = (int)SendMessage(hCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)t->strokes[t->selIdx].fontName.c_str());
-                if (idx == CB_ERR) idx = 0;
-                SendMessage(hCombo, CB_SETCURSEL, idx, 0);
-                wchar_t buf[16];
-                swprintf_s(buf, L"%d", t->strokes[t->selIdx].fontSize);
-                SetDlgItemText(hDlg, 302, buf);
-                return TRUE;
-            }
-            TabData* t = (TabData*)GetWindowLongPtr(hDlg, DWLP_USER);
-            if (!t) return FALSE;
-            if (msg == WM_COMMAND && LOWORD(wp) == IDOK) {
-                wchar_t txt[256];
-                GetDlgItemText(hDlg, 300, txt, 256);
-                HWND hCombo = GetDlgItem(hDlg, 301);
-                int idx = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
-                wchar_t fn[LF_FACESIZE];
-                SendMessage(hCombo, CB_GETLBTEXT, idx, (LPARAM)fn);
-                wchar_t bf[16];
-                GetDlgItemText(hDlg, 302, bf, 16);
-                int sz = max(6, min(200, _wtoi(bf)));
-                auto& s = t->strokes[t->selIdx];
-                s.text = txt;
-                s.fontName = fn;
-                s.fontSize = sz;
-                g.fontName = fn;
-                g.fontSize = sz;
-                EndDialog(hDlg, IDOK);
-                InvalidateRect(g.hwndCanvas, nullptr, FALSE);
-                return TRUE;
-            }
-            if (msg == WM_COMMAND && (LOWORD(wp) == IDCANCEL || LOWORD(wp) == 2)) {
-                EndDialog(hDlg, 0); return TRUE;
-            }
-            if (msg == WM_CLOSE) { EndDialog(hDlg, 0); return TRUE; }
-            return FALSE;
-        }, (LPARAM)t);
+    g.hwndFontDlg = CreateDialogParam(nullptr, MAKEINTRESOURCE(IDD_FONT), g.hwndMain,
+        FontDlgProc, (LPARAM)t);
+    if (g.hwndFontDlg) {
+        ShowWindow(g.hwndFontDlg, SW_SHOW);
+        UpdateWindow(g.hwndFontDlg);
+    }
 }
 
 static void OpenImage(HWND hwnd) {
@@ -794,6 +924,8 @@ static void OpenImage(HWND hwnd) {
         HBITMAP hb = LoadImageFile(f, w, h);
         if (hb) {
             SetImage(hb, w, h);
+            TabData* t = ActiveTab();
+            if (t) t->filename = f;
             FitToWindow();
             InvalidateRect(g.hwndCanvas, nullptr, FALSE);
         } else {
@@ -818,6 +950,8 @@ static void SaveImage(HWND hwnd) {
     if (GetSaveFileName(&of)) {
         FlattenToBitmap();
         if (SaveImageFile(t->hBitmap, f)) {
+            t->filename = f;
+            UpdateTabControl();
             wchar_t m[256];
             swprintf_s(m, L"Saved: %s", f);
             SendMessage(g.hStatusbar, SB_SETTEXT, 0, (LPARAM)m);
@@ -888,18 +1022,46 @@ static void UpdateStatus() {
     SendMessage(g.hStatusbar, SB_SETTEXT, 0, (LPARAM)buf);
 }
 
+static void PositionTabCloseBtns() {
+    if (!g.hwndTab) return;
+    for (HWND hb : g.tabCloseBtns) DestroyWindow(hb);
+    g.tabCloseBtns.clear();
+    int count = TabCtrl_GetItemCount(g.hwndTab);
+    int btnW = 18, btnH = 18;
+    for (int i = 0; i < count; i++) {
+        RECT tabRc = {};
+        TabCtrl_GetItemRect(g.hwndTab, i, &tabRc);
+        int bx = tabRc.right - btnW - 2;
+        int by = tabRc.top + (tabRc.bottom - tabRc.top - btnH) / 2;
+        int id = IDC_TAB_CLOSE + i;
+        HWND hb = CreateWindowEx(0, L"Button", L"x",
+            WS_CHILD | WS_VISIBLE | BS_FLAT | BS_PUSHBUTTON,
+            bx, by, btnW, btnH,
+            g.hwndTab, (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
+        SendMessage(hb, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), 0);
+        g.tabCloseBtns.push_back(hb);
+    }
+}
+
 static void UpdateTabControl() {
     if (!g.hwndTab) return;
     TCITEM tie = {};
     tie.mask = TCIF_TEXT;
     while (TabCtrl_DeleteItem(g.hwndTab, 0));
     for (size_t i = 0; i < g.tabs.size(); i++) {
-        wchar_t label[32];
-        swprintf_s(label, L"Screenshot %d", g.tabs[i].id);
+        wchar_t label[64];
+        if (!g.tabs[i].filename.empty()) {
+            const wchar_t* fname = wcsrchr(g.tabs[i].filename.c_str(), L'\\');
+            fname = fname ? fname + 1 : g.tabs[i].filename.c_str();
+            wcscpy_s(label, fname);
+        } else {
+            swprintf_s(label, L"Screenshot %d", g.tabs[i].id);
+        }
         tie.pszText = label;
         TabCtrl_InsertItem(g.hwndTab, (int)i, &tie);
     }
     TabCtrl_SetCurSel(g.hwndTab, g.activeTab);
+    PositionTabCloseBtns();
 }
 
 static void SwitchToTab(int idx) {
@@ -912,8 +1074,8 @@ static void SwitchToTab(int idx) {
     InvalidateRect(g.hwndMain, nullptr, FALSE);
     RebuildToolbar();
     UpdateStatus();
+    PositionTabCloseBtns();
 }
-
 static void CloseTab(int idx) {
     if (idx < 0 || idx >= (int)g.tabs.size()) return;
     if (g.tabs[idx].hBitmap) DeleteObject(g.tabs[idx].hBitmap);
@@ -932,365 +1094,52 @@ static void CloseTab(int idx) {
     InvalidateRect(g.hwndCanvas, nullptr, FALSE);
 }
 
-static void DrawIcon_New(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(46, 204, 113);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 6, cy - 7, cx + 2, cy + 7);
-    MoveToEx(hdc, cx + 2, cy - 7, nullptr);
-    LineTo(hdc, cx + 2, cy - 3);
-    LineTo(hdc, cx + 6, cy - 7);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Open(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(52, 152, 219);
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = CreateSolidBrush(RGB(52, 152, 219));
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 7, cy - 2, cx + 7, cy + 7);
-    SelectObject(hdc, ob); DeleteObject(br);
-    br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    ob = SelectObject(hdc, br);
-    MoveToEx(hdc, cx - 7, cy - 2, nullptr);
-    LineTo(hdc, cx - 5, cy - 6);
-    LineTo(hdc, cx + 1, cy - 6);
-    LineTo(hdc, cx + 3, cy - 2);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Save(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(52, 152, 219);
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 6, cy - 6, cx + 6, cy + 6);
-    Rectangle(hdc, cx - 4, cy - 2, cx + 4, cy + 5);
-    MoveToEx(hdc, cx - 4, cy - 4, nullptr);
-    LineTo(hdc, cx - 1, cy - 4);
-    LineTo(hdc, cx - 1, cy - 1);
-    LineTo(hdc, cx - 4, cy - 1);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Undo(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(230, 126, 34);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Arc(hdc, cx - 6, cy - 6, cx + 4, cy + 4, cx + 3, cy - 5, cx - 6, cy);
-    MoveToEx(hdc, cx - 2, cy - 7, nullptr);
-    LineTo(hdc, cx - 6, cy - 3);
-    LineTo(hdc, cx - 2, cy);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Redo(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(230, 126, 34);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Arc(hdc, cx - 4, cy - 6, cx + 6, cy + 4, cx - 3, cy - 5, cx + 6, cy);
-    MoveToEx(hdc, cx + 2, cy - 7, nullptr);
-    LineTo(hdc, cx + 6, cy - 3);
-    LineTo(hdc, cx + 2, cy);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Copy(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(26, 188, 156);
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 5, cy - 6, cx + 5, cy + 1);
-    Rectangle(hdc, cx - 3, cy - 3, cx + 7, cy + 7);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Paste(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(26, 188, 156);
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = CreateSolidBrush(fc);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 5, cy - 1, cx + 5, cy + 7);
-    SelectObject(hdc, ob); DeleteObject(br);
-    br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 4, cy - 6, cx + 4, cy + 1);
-    SelectObject(hdc, ob);
-    MoveToEx(hdc, cx, cy - 8, nullptr);
-    LineTo(hdc, cx, cy - 3);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Fullscreen(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(155, 89, 182);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 6, cy - 6, cx + 6, cy + 6);
-    MoveToEx(hdc, cx - 3, cy - 6, nullptr);
-    LineTo(hdc, cx - 3, cy - 3);
-    LineTo(hdc, cx - 6, cy - 3);
-    MoveToEx(hdc, cx + 3, cy + 6, nullptr);
-    LineTo(hdc, cx + 3, cy + 3);
-    LineTo(hdc, cx + 6, cy + 3);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Region(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(155, 89, 182);
-    HPEN pen = CreatePen(PS_DOT, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 6, cy - 6, cx + 6, cy + 6);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Select(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(236, 240, 241);
-    POINT pts[] = { { cx - 3, cy - 6 }, { cx - 3, cy + 5 }, { cx + 0, cy + 2 },
-                    { cx + 2, cy + 5 }, { cx + 4, cy + 3 }, { cx + 1, cy + 1 },
-                    { cx + 4, cy - 2 } };
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = CreateSolidBrush(fc);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Polygon(hdc, pts, 7);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen); DeleteObject(br);
-}
-static void DrawIcon_Pen(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(231, 76, 60);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 5, cy + 5, nullptr);
-    LineTo(hdc, cx + 4, cy - 6);
-    MoveToEx(hdc, cx - 5, cy + 5, nullptr);
-    LineTo(hdc, cx - 1, cy + 5);
-    MoveToEx(hdc, cx - 5, cy + 5, nullptr);
-    LineTo(hdc, cx - 5, cy + 1);
-    SelectObject(hdc, op);
-    DeleteObject(pen);
-}
-static void DrawIcon_Line(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(52, 152, 219);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 5, cy + 5, nullptr);
-    LineTo(hdc, cx + 5, cy - 5);
-    SelectObject(hdc, op);
-    DeleteObject(pen);
-}
-static void DrawIcon_Rect(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(243, 156, 18);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 6, cy - 4, cx + 6, cy + 4);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Ellipse(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(155, 89, 182);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Ellipse(hdc, cx - 6, cy - 4, cx + 6, cy + 4);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Text(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(26, 188, 156);
-    HFONT hf = CreateFont(13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+static void DrawFontIcon(HDC hdc, int cx, int cy, wchar_t glyph, COLORREF c) {
+    HFONT hf = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
     HFONT old = (HFONT)SelectObject(hdc, hf);
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, fc);
-    TextOut(hdc, cx - 5, cy - 7, L"Ab", 2);
+    SetTextColor(hdc, c);
+    wchar_t str[2] = { glyph, 0 };
+    SIZE sz;
+    GetTextExtentPoint32W(hdc, str, 1, &sz);
+    TextOutW(hdc, cx - sz.cx / 2, cy - sz.cy / 2, str, 1);
     SelectObject(hdc, old);
     DeleteObject(hf);
 }
-static void DrawIcon_Callout(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(243, 156, 18);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = CreateSolidBrush(RGB(243, 156, 18));
-    HBRUSH obr = (HBRUSH)SelectObject(hdc, br);
-    RoundRect(hdc, cx - 7, cy - 6, cx + 6, cy + 2, 4, 4);
-    SelectObject(hdc, obr);
-    DeleteObject(br);
-    MoveToEx(hdc, cx - 1, cy + 2, nullptr);
-    LineTo(hdc, cx - 5, cy + 7);
-    SelectObject(hdc, op);
-    DeleteObject(pen);
-}
-static void DrawIcon_Highlighter(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(241, 196, 15);
-    HPEN pen = CreatePen(PS_SOLID, 5, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 6, cy + 3, nullptr);
-    LineTo(hdc, cx + 6, cy - 5);
-    SelectObject(hdc, op);
-    DeleteObject(pen);
-}
-static void DrawIcon_Arrow(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(231, 76, 60);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 5, cy + 4, nullptr);
-    LineTo(hdc, cx + 3, cy - 5);
-    MoveToEx(hdc, cx + 3, cy - 5, nullptr);
-    LineTo(hdc, cx - 1, cy - 3);
-    MoveToEx(hdc, cx + 3, cy - 5, nullptr);
-    LineTo(hdc, cx + 1, cy - 1);
-    SelectObject(hdc, op);
-    DeleteObject(pen);
-}
-static void DrawIcon_Eraser(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(241, 196, 15);
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = CreateSolidBrush(RGB(241, 196, 15));
-    HGDIOBJ ob = SelectObject(hdc, br);
-    POINT pts[] = { { cx - 5, cy - 3 }, { cx + 1, cy - 3 }, { cx + 5, cy + 1 }, { cx - 1, cy + 5 }, { cx - 5, cy + 3 } };
-    Polygon(hdc, pts, 5);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen); DeleteObject(br);
-}
-static void DrawIcon_Fill(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(52, 152, 219);
-    HPEN pen = CreatePen(PS_SOLID, 1, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = CreateSolidBrush(RGB(52, 152, 219));
-    HGDIOBJ ob = SelectObject(hdc, br);
-    MoveToEx(hdc, cx - 4, cy - 4, nullptr);
-    LineTo(hdc, cx - 1, cy - 1);
-    LineTo(hdc, cx + 1, cy - 1);
-    LineTo(hdc, cx + 4, cy + 2);
-    LineTo(hdc, cx + 2, cy + 5);
-    LineTo(hdc, cx - 1, cy + 2);
-    LineTo(hdc, cx + 1, cy - 1);
-    SelectObject(hdc, ob); DeleteObject(br);
-    SelectObject(hdc, op);
-    DeleteObject(pen);
-}
-static void DrawIcon_Crop(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(26, 188, 156);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 5, cy - 5, cx + 5, cy + 5);
-    MoveToEx(hdc, cx - 8, cy - 2, nullptr); LineTo(hdc, cx + 2, cy - 2);
-    MoveToEx(hdc, cx - 2, cy - 8, nullptr); LineTo(hdc, cx - 2, cy + 2);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Resize(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(149, 165, 166);
-    HPEN pen = CreatePen(PS_SOLID, 2, fc);
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HBRUSH br = (HBRUSH)GetStockObject(NULL_BRUSH);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    Rectangle(hdc, cx - 5, cy - 5, cx + 5, cy + 5);
-    MoveToEx(hdc, cx - 8, cy, nullptr); LineTo(hdc, cx + 8, cy);
-    MoveToEx(hdc, cx, cy - 8, nullptr); LineTo(hdc, cx, cy + 8);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen);
-}
-static void DrawIcon_Color(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    HBRUSH br = CreateSolidBrush(g.penColor);
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
-    HPEN op = (HPEN)SelectObject(hdc, pen);
-    HGDIOBJ ob = SelectObject(hdc, br);
-    RoundRect(hdc, cx - 5, cy - 5, cx + 5, cy + 5, 3, 3);
-    SelectObject(hdc, op); SelectObject(hdc, ob);
-    DeleteObject(pen); DeleteObject(br);
-}
-static void DrawIcon_Width(HDC hdc, int cx, int cy, COLORREF c) {
-    (void)c;
-    COLORREF fc = RGB(149, 165, 166);
-    HPEN pen;
-    HPEN op;
-    pen = CreatePen(PS_SOLID, 1, fc); op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 5, cy - 3, nullptr); LineTo(hdc, cx + 5, cy - 3);
-    SelectObject(hdc, op); DeleteObject(pen);
-    pen = CreatePen(PS_SOLID, 2, fc); op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 5, cy, nullptr); LineTo(hdc, cx + 5, cy);
-    SelectObject(hdc, op); DeleteObject(pen);
-    pen = CreatePen(PS_SOLID, 3, fc); op = (HPEN)SelectObject(hdc, pen);
-    MoveToEx(hdc, cx - 5, cy + 3, nullptr); LineTo(hdc, cx + 5, cy + 3);
-    SelectObject(hdc, op); DeleteObject(pen);
-}
 
-typedef void (*IconDrawFn)(HDC, int, int, COLORREF);
-struct IconBtn { int id; IconDrawFn fn; };
+struct IconBtn { int id; wchar_t glyph; };
 static const IconBtn ICON_BUTTONS[] = {
-    { IDM_FILE_NEW,           DrawIcon_New },
-    { IDM_FILE_OPEN,          DrawIcon_Open },
-    { IDM_FILE_SAVE,          DrawIcon_Save },
-    { 0, nullptr },
-    { IDM_EDIT_UNDO,          DrawIcon_Undo },
-    { IDM_EDIT_REDO,          DrawIcon_Redo },
-    { 0, nullptr },
-    { IDM_EDIT_COPY,          DrawIcon_Copy },
-    { IDM_EDIT_PASTE,         DrawIcon_Paste },
-    { 0, nullptr },
-    { IDM_CAPTURE_FULLSCREEN, DrawIcon_Fullscreen },
-    { IDM_CAPTURE_REGION,     DrawIcon_Region },
-    { 0, nullptr },
-    { IDM_TOOL_SELECT,        DrawIcon_Select },
-    { IDM_TOOL_PEN,           DrawIcon_Pen },
-    { IDM_TOOL_LINE,          DrawIcon_Line },
-    { IDM_TOOL_RECT,          DrawIcon_Rect },
-    { IDM_TOOL_ELLIPSE,       DrawIcon_Ellipse },
-    { IDM_TOOL_ARROW,         DrawIcon_Arrow },
-    { IDM_TOOL_ERASER,        DrawIcon_Eraser },
-    { IDM_TOOL_FILL,          DrawIcon_Fill },
-    { IDM_TOOL_TEXT,          DrawIcon_Text },
-    { IDM_TOOL_CALLOUT,      DrawIcon_Callout },
-    { IDM_TOOL_HIGHLIGHTER,  DrawIcon_Highlighter },
-    { 0, nullptr },
-    { IDC_COLOR_BTN,          DrawIcon_Color },
-    { IDC_PEN_WIDTH,          DrawIcon_Width },
-    { IDM_EDIT_CROP,          DrawIcon_Crop },
-    { IDM_EDIT_RESIZE,        DrawIcon_Resize },
+    { IDM_FILE_NEW,           0xE7C3 },
+    { IDM_FILE_OPEN,          0xE838 },
+    { IDM_FILE_SAVE,          0xE74E },
+    { 0, 0 },
+    { IDM_EDIT_UNDO,          0xE7A7 },
+    { IDM_EDIT_REDO,          0xE7A6 },
+    { 0, 0 },
+    { IDM_EDIT_COPY,          0xE8C8 },
+    { IDM_EDIT_PASTE,         0xE77F },
+    { 0, 0 },
+    { IDM_CAPTURE_FULLSCREEN, 0xE740 },
+    { IDM_CAPTURE_REGION,     0xE8B3 },
+    { 0, 0 },
+    { IDM_TOOL_SELECT,        0xE7C9 },
+    { IDM_TOOL_PEN,           0xE76D },
+    { IDM_TOOL_LINE,          0xEC87 },
+    { IDM_TOOL_RECT,          0xE739 },
+    { IDM_TOOL_ELLIPSE,       0xEA3A },
+    { IDM_TOOL_ARROW,         0xE72A },
+    { IDM_TOOL_ERASER,        0xE75C },
+    { IDM_TOOL_FILL,          0xE790 },
+    { IDM_TOOL_TEXT,          0xE8D2 },
+    { IDM_TOOL_CALLOUT,      0xE90A },
+    { IDM_TOOL_HIGHLIGHTER,  0xE891 },
+    { 0, 0 },
+    { IDC_COLOR_BTN,          0xE790 },
+    { IDC_PEN_WIDTH,          0xE8E3 },
+    { IDM_EDIT_CROP,          0xE7A8 },
+    { IDM_EDIT_RESIZE,        0xE744 },
 };
 
 static const wchar_t* GetTooltipForId(int id) {
@@ -1327,12 +1176,12 @@ static void RebuildToolbar() {
     g.tbBtns.clear();
     TabData* t = ActiveTab();
     int x = 4;
-    int bh = 32;
+    int bh = 38;
     int by = (g.toolbarH - bh) / 2;
-    int btnW = 30;
+    int btnW = 38;
 
     for (int i = 0; i < _countof(ICON_BUTTONS); i++) {
-        if (ICON_BUTTONS[i].fn == nullptr) {
+        if (ICON_BUTTONS[i].glyph == 0) {
             g.tbBtns.push_back({ 0, x, by, 8, bh, true, true });
             x += 10;
         } else {
@@ -1387,11 +1236,16 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
         bool hover = ((int)i == g.hoverBtn);
         bool selected = false;
         if (b.id == IDM_TOOL_SELECT) selected = (g.currentTool == Tool::Select);
-        else if (b.id >= IDM_TOOL_PEN && b.id <= IDM_TOOL_FILL) {
-            Tool tmap[] = { Tool::Pen, Tool::Line, Tool::Rectangle, Tool::Ellipse, Tool::Arrow, Tool::Eraser, Tool::Fill };
-            int tidx = b.id - IDM_TOOL_PEN;
-            if (tidx >= 0 && tidx < 7) selected = (g.currentTool == tmap[tidx]);
-        }
+        else if (b.id == IDM_TOOL_PEN) selected = (g.currentTool == Tool::Pen);
+        else if (b.id == IDM_TOOL_LINE) selected = (g.currentTool == Tool::Line);
+        else if (b.id == IDM_TOOL_RECT) selected = (g.currentTool == Tool::Rectangle);
+        else if (b.id == IDM_TOOL_ELLIPSE) selected = (g.currentTool == Tool::Ellipse);
+        else if (b.id == IDM_TOOL_ERASER) selected = (g.currentTool == Tool::Eraser);
+        else if (b.id == IDM_TOOL_TEXT) selected = (g.currentTool == Tool::Text);
+        else if (b.id == IDM_TOOL_ARROW) selected = (g.currentTool == Tool::Arrow);
+        else if (b.id == IDM_TOOL_FILL) selected = (g.currentTool == Tool::Fill);
+        else if (b.id == IDM_TOOL_CALLOUT) selected = (g.currentTool == Tool::Callout);
+        else if (b.id == IDM_TOOL_HIGHLIGHTER) selected = (g.currentTool == Tool::Highlighter);
 
         if (selected) {
             HBRUSH hbs = CreateSolidBrush(RGB(0, 122, 204));
@@ -1417,8 +1271,31 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
                              hover ? RGB(240, 240, 240) : RGB(180, 180, 180);
 
         for (int fi = 0; fi < _countof(ICON_BUTTONS); fi++) {
-            if (ICON_BUTTONS[fi].id == b.id && ICON_BUTTONS[fi].fn) {
-                ICON_BUTTONS[fi].fn(hdc, b.x + b.w / 2, b.y + b.h / 2, iconColor);
+            if (ICON_BUTTONS[fi].id == b.id && ICON_BUTTONS[fi].glyph) {
+                if (b.id == IDC_COLOR_BTN) {
+                    HBRUSH br = CreateSolidBrush(g.penColor);
+                    HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
+                    HPEN op = (HPEN)SelectObject(hdc, pen);
+                    HGDIOBJ ob = SelectObject(hdc, br);
+                    RoundRect(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2 - 5, b.x + b.w / 2 + 5, b.y + b.h / 2 + 5, 3, 3);
+                    SelectObject(hdc, op); SelectObject(hdc, ob);
+                    DeleteObject(pen); DeleteObject(br);
+                } else if (b.id == IDC_PEN_WIDTH) {
+                    COLORREF fc = iconColor;
+                    HPEN pen;
+                    HPEN op2;
+                    pen = CreatePen(PS_SOLID, 1, fc); op2 = (HPEN)SelectObject(hdc, pen);
+                    MoveToEx(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2 - 3, nullptr); LineTo(hdc, b.x + b.w / 2 + 5, b.y + b.h / 2 - 3);
+                    SelectObject(hdc, op2); DeleteObject(pen);
+                    pen = CreatePen(PS_SOLID, 2, fc); op2 = (HPEN)SelectObject(hdc, pen);
+                    MoveToEx(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2, nullptr); LineTo(hdc, b.x + b.w / 2 + 5, b.y + b.h / 2);
+                    SelectObject(hdc, op2); DeleteObject(pen);
+                    pen = CreatePen(PS_SOLID, 3, fc); op2 = (HPEN)SelectObject(hdc, pen);
+                    MoveToEx(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2 + 3, nullptr); LineTo(hdc, b.x + b.w / 2 + 5, b.y + b.h / 2 + 3);
+                    SelectObject(hdc, op2); DeleteObject(pen);
+                } else {
+                    DrawFontIcon(hdc, b.x + b.w / 2, b.y + b.h / 2, ICON_BUTTONS[fi].glyph, iconColor);
+                }
                 break;
             }
         }
@@ -1590,12 +1467,13 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     HFONT hof2 = (HFONT)SelectObject(hdcMem, hf);
                     SetBkMode(hdcMem, TRANSPARENT);
                     SetTextColor(hdcMem, s.color);
-                    SIZE tsz = { 0, 0 };
-                    if (!s.text.empty())
-                        GetTextExtentPoint32(hdcMem, s.text.c_str(), (int)s.text.size(), &tsz);
                     int pad = (int)(6 * zz);
-                    int bw = tsz.cx + pad * 2;
-                    int bh = tsz.cy + pad * 2;
+                    int maxBubbleW = max(100, (int)(300 * zz));
+                    RECT rcCalc = { 0, 0, maxBubbleW, 10000 };
+                    if (!s.text.empty())
+                        DrawText(hdcMem, s.text.c_str(), (int)s.text.size(), &rcCalc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
+                    int bw = rcCalc.right + pad * 2;
+                    int bh = rcCalc.bottom + pad * 2;
                     int bx = (int)(s.endPt.x * zz + T->offsetX) - bw / 2;
                     int by = (int)(s.endPt.y * zz + T->offsetY) - bh / 2;
                     HBRUSH bgBr = CreateSolidBrush(RGB(255, 255, 255));
@@ -1607,34 +1485,53 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SelectObject(hdcMem, op2);
                     DeleteObject(bgBr);
                     DeleteObject(borderPen);
-                    TextOut(hdcMem, bx + pad, by + pad, s.text.c_str(), (int)s.text.size());
+                    RECT rcTxt = { bx + pad, by + pad, bx + bw - pad, by + bh - pad };
+                    if (!s.text.empty())
+                        DrawText(hdcMem, s.text.c_str(), (int)s.text.size(), &rcTxt, DT_LEFT | DT_TOP | DT_WORDBREAK);
                     double acx = s.endPt.x * zz + T->offsetX;
                     double acy = s.endPt.y * zz + T->offsetY;
                     double atx = s.startPt.x * zz + T->offsetX;
                     double aty = s.startPt.y * zz + T->offsetY;
                     double ang = atan2(aty - acy, atx - acx);
-                    double bx1 = bx, by1 = by, bx2 = bx + bw, by2 = by + bh;
-                    double ix = acx, iy = acy;
                     double adx = cos(ang), ady = sin(ang);
-                    if (adx > 0) ix = bx2; else if (adx < 0) ix = bx1;
-                    if (ady > 0) iy = by2; else if (ady < 0) iy = by1;
+                    double ix = acx, iy = acy;
+                    if (adx > 0) ix = bx + bw; else if (adx < 0) ix = bx;
+                    if (ady > 0) iy = by + bh; else if (ady < 0) iy = by;
                     if (adx != 0) { double t = (ix - acx) / adx; iy = acy + t * ady; }
-                    if (iy < by1 || iy > by2) {
-                        if (ady > 0) iy = by2; else iy = by1;
+                    if (iy < by || iy > by + bh) {
+                        if (ady > 0) iy = by + bh; else iy = by;
                         double t = (iy - acy) / ady;
                         ix = acx + t * adx;
                     }
                     HPEN arrPen = CreatePen(PS_SOLID, max(1, (int)(s.penWidth * zz)), s.color);
                     HPEN op3 = (HPEN)SelectObject(hdcMem, arrPen);
-                    MoveToEx(hdcMem, (int)ix, (int)iy, nullptr);
-                    LineTo(hdcMem, (int)atx, (int)aty);
-                    double hl = max(8.0, 12.0 * zz);
-                    MoveToEx(hdcMem, (int)atx, (int)aty, nullptr);
-                    LineTo(hdcMem, (int)(atx - hl * cos(ang - 0.4)), (int)(aty - hl * sin(ang - 0.4)));
-                    MoveToEx(hdcMem, (int)atx, (int)aty, nullptr);
-                    LineTo(hdcMem, (int)(atx - hl * cos(ang + 0.4)), (int)(aty - hl * sin(ang + 0.4)));
+                    HBRUSH arrBr = CreateSolidBrush(s.color);
+                    HBRUSH ob3 = (HBRUSH)SelectObject(hdcMem, arrBr);
+                    POINT arrowTail = { (int)ix, (int)iy };
+                    POINT arrowTip = { (int)atx, (int)aty };
+                    double adx2 = arrowTip.x - arrowTail.x;
+                    double ady2 = arrowTip.y - arrowTail.y;
+                    double len = sqrt(adx2 * adx2 + ady2 * ady2);
+                    if (len > 1) {
+                        double nx = adx2 / len, ny = ady2 / len;
+                        double hl = max(8.0, 12.0 * zz);
+                        double hw = hl * 0.5;
+                        POINT pts[3] = {
+                            arrowTip,
+                            { (int)(arrowTip.x - nx * hl + ny * hw), (int)(arrowTip.y - ny * hl - nx * hw) },
+                            { (int)(arrowTip.x - nx * hl - ny * hw), (int)(arrowTip.y - ny * hl + nx * hw) }
+                        };
+                        Polygon(hdcMem, pts, 3);
+                        double shaftLen = len - hl * 0.3;
+                        if (shaftLen > 0) {
+                            MoveToEx(hdcMem, (int)(arrowTail.x), (int)(arrowTail.y), nullptr);
+                            LineTo(hdcMem, (int)(arrowTail.x + nx * shaftLen), (int)(arrowTail.y + ny * shaftLen));
+                        }
+                    }
                     SelectObject(hdcMem, op3);
+                    SelectObject(hdcMem, ob3);
                     DeleteObject(arrPen);
+                    DeleteObject(arrBr);
                     SelectObject(hdcMem, hof2);
                     DeleteObject(hf);
                     break;
@@ -1848,7 +1745,8 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s.text = L"Text";
             T->strokes.push_back(s);
             T->selIdx = (int)T->strokes.size() - 1;
-            ShowFontDlg();
+            g.currentTool = Tool::Select;
+            PostMessage(hwnd, WM_DEFER_FONTDLG, 0, 0);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -1880,7 +1778,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDBLCLK: {
         if (g.currentTool == Tool::Select && T->selIdx >= 0 &&
             (T->strokes[T->selIdx].tool == Tool::Text || T->strokes[T->selIdx].tool == Tool::Callout)) {
-            ShowFontDlg();
+            PostMessage(hwnd, WM_DEFER_FONTDLG, 0, 0);
         }
         return 0;
     }
@@ -2005,7 +1903,8 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 T->redoStack.clear();
                 if (g.currentTool == Tool::Callout) {
                     T->selIdx = (int)T->strokes.size() - 1;
-                    ShowFontDlg();
+                    g.currentTool = Tool::Select;
+                    PostMessage(hwnd, WM_DEFER_FONTDLG, 0, 0);
                 }
             } else {
                 T->redoStack.clear();
@@ -2046,6 +1945,10 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateStatus();
         return 0;
     }
+    case WM_DEFER_FONTDLG: {
+        ShowFontDlg();
+        return 0;
+    }
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -2057,11 +1960,13 @@ static int g_overlayVirtX = 0, g_overlayVirtY = 0;
 static POINT g_overlayStart = {};
 static POINT g_overlayCur = {};
 static bool g_overlayDragging = false;
+static std::vector<RECT> g_monitorRects;
 
 static void Overlay_Finish(HWND hwndMain, bool ok) {
     if (g_overlayScreenBmp) { DeleteObject(g_overlayScreenBmp); g_overlayScreenBmp = nullptr; }
     if (g_hwndOverlay) { DestroyWindow(g_hwndOverlay); g_hwndOverlay = nullptr; }
     g_overlayDragging = false;
+    g_monitorRects.clear();
     if (ok) {
         int x = min(g_overlayStart.x, g_overlayCur.x) + g_overlayVirtX;
         int y = min(g_overlayStart.y, g_overlayCur.y) + g_overlayVirtY;
@@ -2082,6 +1987,13 @@ static void Overlay_Finish(HWND hwndMain, bool ok) {
         ShowWindow(hwndMain, SW_RESTORE);
     }
     InvalidateRect(hwndMain, nullptr, FALSE);
+}
+
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lprcMonitor, LPARAM dwData) {
+    (void)hMon; (void)hdcMon; (void)dwData;
+    RECT rc = *lprcMonitor;
+    g_monitorRects.push_back(rc);
+    return TRUE;
 }
 
 static void Overlay_UpdateRegion() {
@@ -2172,10 +2084,6 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SETCURSOR:
-        if (g_overlayDragging) {
-            SetCursor(LoadCursor(nullptr, IDC_CROSS));
-            return TRUE;
-        }
         SetCursor(LoadCursor(nullptr, IDC_CROSS));
         return TRUE;
     }
@@ -2183,22 +2091,10 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static WNDPROC g_prevTabProc = nullptr;
-static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN) {
-        TCHITTESTINFO thti = {};
-        thti.pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int idx = (int)SendMessage(hwnd, TCM_HITTEST, 0, (LPARAM)&thti);
-        if (idx >= 0 && idx < (int)g.tabs.size()) {
-            RECT tabRc = {};
-            TabCtrl_GetItemRect(hwnd, idx, &tabRc);
-            int closeW = 16;
-            int closeX = tabRc.right - closeW;
-            POINT clickPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            if (clickPt.x >= closeX && clickPt.x <= tabRc.right) {
-                CloseTab(idx);
-                return 0;
-            }
-        }
+static LRESULT CALLBACK TabBtnForwardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND) {
+        SendMessage(g.hwndMain, msg, wp, lp);
+        return 0;
     }
     return CallWindowProc(g_prevTabProc, hwnd, msg, wp, lp);
 }
@@ -2215,14 +2111,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, hwnd, (HMENU)IDC_STATUSBAR, nullptr, nullptr);
 
         g.hwndTab = CreateWindowEx(0, WC_TABCONTROL, nullptr,
-            WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH | TCS_FORCELABELLEFT | TCS_OWNERDRAWFIXED,
+            WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH | TCS_FORCELABELLEFT,
             0, 0, 0, 0, hwnd, (HMENU)IDC_TAB, nullptr, nullptr);
         SendMessage(g.hwndTab, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), 0);
         RECT tabRc = {};
         SendMessage(g.hwndTab, TCM_ADJUSTRECT, FALSE, (LPARAM)&tabRc);
         int tabH = 24;
         SendMessage(g.hwndTab, TCM_SETITEMSIZE, 0, MAKELPARAM(120, tabH));
-        g_prevTabProc = (WNDPROC)SetWindowLongPtr(g.hwndTab, GWLP_WNDPROC, (LONG_PTR)TabSubclassProc);
+        g_prevTabProc = (WNDPROC)SetWindowLongPtr(g.hwndTab, GWLP_WNDPROC, (LONG_PTR)TabBtnForwardProc);
 
         g.hwndCanvas = CreateWindowEx(0, L"Static", nullptr,
             WS_CHILD | WS_VISIBLE | SS_NOTIFY,
@@ -2263,6 +2159,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, FALSE);
         InvalidateRect(g.hwndCanvas, nullptr, FALSE);
         UpdateStatus();
+        PositionTabCloseBtns();
         return 0;
     }
 
@@ -2330,6 +2227,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_FILE_SAVE:
         case IDM_FILE_SAVEAS:   SaveImage(hwnd); break;
         case IDM_FILE_CLOSE_TAB: CloseTab(g.activeTab); break;
+        default:
+            if (id >= IDC_TAB_CLOSE && id < IDC_TAB_CLOSE + (int)g.tabs.size()) {
+                CloseTab(id - IDC_TAB_CLOSE);
+            }
+            break;
         case IDM_FILE_EXIT:     PostQuitMessage(0); break;
 
         case IDM_EDIT_UNDO:
@@ -2398,15 +2300,65 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case IDM_CAPTURE_FULLSCREEN: {
             FlattenToBitmap();
-            HideAndCapture(hwnd);
-            HBITMAP hb = CaptureScreen();
-            int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-            int ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-            ShowWindow(hwnd, SW_RESTORE);
-            if (hb) {
-                SetImage(hb, cw, ch);
-                FitToWindow();
-                InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+            g_monitorRects.clear();
+            EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, 0);
+            if ((int)g_monitorRects.size() > 1) {
+                POINT pt = { 0, 0 };
+                ClientToScreen(hwnd, &pt);
+                pt.x += 200;
+                pt.y += g.toolbarH + 2;
+                HMENU hMenu = CreatePopupMenu();
+                for (int i = 0; i < (int)g_monitorRects.size() && i < 8; i++) {
+                    const RECT& mr = g_monitorRects[i];
+                    wchar_t label[64];
+                    wsprintfW(label, L"Monitor %d  (%dx%d)", i + 1,
+                        mr.right - mr.left, mr.bottom - mr.top);
+                    AppendMenuW(hMenu, MF_STRING, IDM_CAPTURE_MON1 + i, label);
+                }
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(hMenu, MF_STRING, IDM_CAPTURE_MON_ALL, L"All Monitors");
+                int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x, pt.y, 0, hwnd, nullptr);
+                DestroyMenu(hMenu);
+                if (cmd == IDM_CAPTURE_MON_ALL) {
+                    HideAndCapture(hwnd);
+                    HBITMAP hb = CaptureScreen();
+                    int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                    int ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                    ShowWindow(hwnd, SW_RESTORE);
+                    if (hb) {
+                        SetImage(hb, cw, ch);
+                        FitToWindow();
+                        InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+                    }
+                } else if (cmd >= IDM_CAPTURE_MON1 && cmd <= IDM_CAPTURE_MON8) {
+                    int idx = cmd - IDM_CAPTURE_MON1;
+                    if (idx < (int)g_monitorRects.size()) {
+                        const RECT& mr = g_monitorRects[idx];
+                        int mx = mr.left, my = mr.top;
+                        int mw = mr.right - mr.left, mh = mr.bottom - mr.top;
+                        HideAndCapture(hwnd);
+                        HBITMAP hb = CaptureRegion(mx, my, mw, mh);
+                        ShowWindow(hwnd, SW_RESTORE);
+                        if (hb) {
+                            SetImage(hb, mw, mh);
+                            FitToWindow();
+                            InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+                        }
+                    }
+                }
+                g_monitorRects.clear();
+            } else {
+                HideAndCapture(hwnd);
+                HBITMAP hb = CaptureScreen();
+                int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                int ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                ShowWindow(hwnd, SW_RESTORE);
+                if (hb) {
+                    SetImage(hb, cw, ch);
+                    FitToWindow();
+                    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+                }
             }
             break;
         }
@@ -2558,60 +2510,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_DRAWITEM: {
-        DRAWITEMSTRUCT* ds = (DRAWITEMSTRUCT*)lp;
-        if (ds->CtlType == ODT_TAB && ds->CtlID == IDC_TAB) {
-            HDC hdc = ds->hDC;
-            RECT rc = ds->rcItem;
-            bool selected = (ds->itemState & ODS_SELECTED);
-
-            int idx = (int)ds->itemID;
-            wchar_t label[64] = {};
-            TCITEM tie = {};
-            tie.mask = TCIF_TEXT;
-            tie.pszText = label;
-            tie.cchTextMax = _countof(label);
-            TabCtrl_GetItem(g.hwndTab, idx, &tie);
-
-            HBRUSH bgBr = CreateSolidBrush(selected ? RGB(45, 45, 48) : RGB(37, 37, 38));
-            FillRect(hdc, &rc, bgBr);
-            DeleteObject(bgBr);
-
-            HPEN linePen = CreatePen(PS_SOLID, 1, RGB(55, 55, 55));
-            HPEN oldPen = (HPEN)SelectObject(hdc, linePen);
-            MoveToEx(hdc, rc.left, rc.bottom - 1, nullptr);
-            LineTo(hdc, rc.right, rc.bottom - 1);
-            SelectObject(hdc, oldPen);
-            DeleteObject(linePen);
-
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, selected ? RGB(255, 255, 255) : RGB(180, 180, 180));
-            HFONT hf = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            HFONT oldFont = (HFONT)SelectObject(hdc, hf);
-
-            int pad = 8;
-            int closeW = 16;
-            RECT textRc = { rc.left + pad, rc.top, rc.right - closeW - pad, rc.bottom };
-            DrawText(hdc, label, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-            int closeSize = 7;
-            int cx = rc.right - closeW / 2;
-            int cy = (rc.top + rc.bottom) / 2;
-            HPEN closePen = CreatePen(PS_SOLID, 1, RGB(150, 150, 150));
-            SelectObject(hdc, closePen);
-            MoveToEx(hdc, cx - closeSize, cy - closeSize, nullptr);
-            LineTo(hdc, cx + closeSize, cy + closeSize);
-            MoveToEx(hdc, cx + closeSize, cy - closeSize, nullptr);
-            LineTo(hdc, cx - closeSize, cy + closeSize);
-            SelectObject(hdc, oldPen);
-            DeleteObject(closePen);
-            SelectObject(hdc, oldFont);
-
-            return TRUE;
-        }
-        break;
-    }
-
     case WM_NOTIFY: {
         NMHDR* hdr = (NMHDR*)lp;
         if (hdr->idFrom == IDC_TAB && hdr->code == TCN_SELCHANGE) {
@@ -2632,7 +2530,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
-    SetProcessDPIAware();
+    typedef BOOL (WINAPI *PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    PFN_SetProcessDpiAwarenessContext pSetDpiCtx =
+        (PFN_SetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+    if (pSetDpiCtx) {
+        pSetDpiCtx(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    } else {
+        SetProcessDPIAware();
+    }
 
     GdiplusStartupInput gdiInput;
     ULONG_PTR gdiToken;
