@@ -186,6 +186,7 @@ static int HitTestShape(POINT imgPt) {
                     return i;
             } else {
                 if (inLeft || inRight || inTop || inBottom) return i;
+                if (imgPt.x >= tl.x && imgPt.x <= br.x && imgPt.y >= tl.y && imgPt.y <= br.y) return i;
             }
             break;
         }
@@ -1694,6 +1695,18 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (g.currentTool == Tool::Select) {
+            int hit = HitTestShape(ip);
+
+            if (hit >= 0 && hit != T->selIdx) {
+                T->selIdx = hit;
+                g.isDraggingSel = true;
+                g.dragStartImg = ip;
+                T->selBackup = T->strokes[hit];
+                InvalidateRect(hwnd, nullptr, FALSE);
+                UpdateStatus();
+                return 0;
+            }
+
             int hh = HitTestHandle(pt);
             if (hh >= 0 && T->selIdx >= 0) {
                 g.isResizingSel = true;
@@ -1703,7 +1716,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetCapture(hwnd);
                 return 0;
             }
-            int hit = HitTestShape(ip);
+
             if (hit >= 0) {
                 T->selIdx = hit;
                 g.isDraggingSel = true;
@@ -1713,6 +1726,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 UpdateStatus();
                 return 0;
             }
+
             T->selIdx = -1;
             InvalidateRect(hwnd, nullptr, FALSE);
             UpdateStatus();
