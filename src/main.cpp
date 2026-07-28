@@ -80,7 +80,7 @@ struct App {
     HWND hwndTab = nullptr;
     std::vector<HWND> tabCloseBtns;
 
-    int toolbarH = 50;
+    int toolbarH = 64;
     int tabH = 24;
     int hoverBtn = -1;
 
@@ -1095,7 +1095,7 @@ static void CloseTab(int idx) {
 }
 
 static void DrawFontIcon(HDC hdc, int cx, int cy, wchar_t glyph, COLORREF c) {
-    HFONT hf = CreateFontW(-22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    HFONT hf = CreateFontW(-28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
     HFONT old = (HFONT)SelectObject(hdc, hf);
@@ -1176,9 +1176,9 @@ static void RebuildToolbar() {
     g.tbBtns.clear();
     TabData* t = ActiveTab();
     int x = 4;
-    int bh = 38;
+    int bh = 50;
     int by = (g.toolbarH - bh) / 2;
-    int btnW = 38;
+    int btnW = 50;
 
     for (int i = 0; i < _countof(ICON_BUTTONS); i++) {
         if (ICON_BUTTONS[i].glyph == 0) {
@@ -1277,7 +1277,7 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
                     HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
                     HPEN op = (HPEN)SelectObject(hdc, pen);
                     HGDIOBJ ob = SelectObject(hdc, br);
-                    RoundRect(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2 - 5, b.x + b.w / 2 + 5, b.y + b.h / 2 + 5, 3, 3);
+                    RoundRect(hdc, b.x + b.w / 2 - 8, b.y + b.h / 2 - 8, b.x + b.w / 2 + 8, b.y + b.h / 2 + 8, 4, 4);
                     SelectObject(hdc, op); SelectObject(hdc, ob);
                     DeleteObject(pen); DeleteObject(br);
                 } else if (b.id == IDC_PEN_WIDTH) {
@@ -1285,13 +1285,13 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
                     HPEN pen;
                     HPEN op2;
                     pen = CreatePen(PS_SOLID, 1, fc); op2 = (HPEN)SelectObject(hdc, pen);
-                    MoveToEx(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2 - 3, nullptr); LineTo(hdc, b.x + b.w / 2 + 5, b.y + b.h / 2 - 3);
+                    MoveToEx(hdc, b.x + b.w / 2 - 8, b.y + b.h / 2 - 5, nullptr); LineTo(hdc, b.x + b.w / 2 + 8, b.y + b.h / 2 - 5);
                     SelectObject(hdc, op2); DeleteObject(pen);
                     pen = CreatePen(PS_SOLID, 2, fc); op2 = (HPEN)SelectObject(hdc, pen);
-                    MoveToEx(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2, nullptr); LineTo(hdc, b.x + b.w / 2 + 5, b.y + b.h / 2);
+                    MoveToEx(hdc, b.x + b.w / 2 - 8, b.y + b.h / 2, nullptr); LineTo(hdc, b.x + b.w / 2 + 8, b.y + b.h / 2);
                     SelectObject(hdc, op2); DeleteObject(pen);
                     pen = CreatePen(PS_SOLID, 3, fc); op2 = (HPEN)SelectObject(hdc, pen);
-                    MoveToEx(hdc, b.x + b.w / 2 - 5, b.y + b.h / 2 + 3, nullptr); LineTo(hdc, b.x + b.w / 2 + 5, b.y + b.h / 2 + 3);
+                    MoveToEx(hdc, b.x + b.w / 2 - 8, b.y + b.h / 2 + 5, nullptr); LineTo(hdc, b.x + b.w / 2 + 8, b.y + b.h / 2 + 5);
                     SelectObject(hdc, op2); DeleteObject(pen);
                 } else {
                     DrawFontIcon(hdc, b.x + b.w / 2, b.y + b.h / 2, ICON_BUTTONS[fi].glyph, iconColor);

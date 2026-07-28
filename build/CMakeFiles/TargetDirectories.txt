@@ -1,0 +1,3 @@
+D:/Projects/temp/screenshot/build/CMakeFiles/ScreenCapture.dir
+D:/Projects/temp/screenshot/build/CMakeFiles/edit_cache.dir
+D:/Projects/temp/screenshot/build/CMakeFiles/rebuild_cache.dir
