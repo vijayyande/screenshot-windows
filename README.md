@@ -2,14 +2,13 @@
 
 Easy to use
 
-**[Downlaod screenshot.exe](https://github.com/vijayyande/screenshot-windows/blob/main/screenshot.exe)**
+**[Downlaod ScreenCapture]([https://github.com/vijayyande/screenshot-windows/blob/main/screenshot.exe](https://github.com/vijayyande/screenshot-windows/blob/main/build/ScreenCapture.exe))**
 
 
-<img width="1270" height="861" alt="image" src="https://github.com/user-attachments/assets/137149d9-2b6a-41a9-93fb-0e61c5e10513" />
+<img width="1306" height="695" alt="image" src="https://github.com/user-attachments/assets/ba823ef3-4090-4ff6-85ed-eb191595ec53" />
 
 
-
-Enojoy! 
+Enjoy! 
 
 
 **Screenshot Editor**
