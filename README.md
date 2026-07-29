@@ -2,7 +2,7 @@
 
 Easy to use
 
-**[Downlaod ScreenCapture]([https://github.com/vijayyande/screenshot-windows/blob/main/screenshot.exe](https://github.com/vijayyande/screenshot-windows/blob/main/build/ScreenCapture.exe))**
+**[Downlaod ScreenCapture]([https://github.com/vijayyande/screenshot-windows/blob/main/screenshot.exe](https://github.com/vijayyande/screenshot-windows/blob/main/build/ScreenCapture.exe)**
 
 
 <img width="1306" height="695" alt="image" src="https://github.com/user-attachments/assets/ba823ef3-4090-4ff6-85ed-eb191595ec53" />
