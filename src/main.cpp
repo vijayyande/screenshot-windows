@@ -807,25 +807,69 @@ static void CropImage(int x, int y, int w, int h) {
     h = min(h, t->imgH - y);
     if (w < 2 || h < 2) return;
 
-    FlattenToBitmap();
+    // Save original tab state
+    HBITMAP hOrigBmp = t->hBitmap;
+    int origW = t->imgW, origH = t->imgH;
+    auto origStrokes = t->strokes;
+    auto origRedo = t->redoStack;
+
     HDC hdcScr = GetDC(nullptr);
-    HDC hdcSrc = CreateCompatibleDC(hdcScr);
-    HDC hdcDst = CreateCompatibleDC(hdcScr);
-    HBITMAP hNew = CreateCompatibleBitmap(hdcScr, w, h);
-    SelectObject(hdcSrc, t->hBitmap);
-    SelectObject(hdcDst, hNew);
-    BitBlt(hdcDst, 0, 0, w, h, hdcSrc, x, y, SRCCOPY);
-    DeleteDC(hdcSrc);
-    DeleteDC(hdcDst);
+
+    // Create a copy of the original bitmap
+    HBITMAP hCopy = CreateCompatibleBitmap(hdcScr, origW, origH);
+    {
+        HDC hdcTemp = CreateCompatibleDC(hdcScr);
+        HGDIOBJ oldTemp = SelectObject(hdcTemp, hCopy);
+        HDC hdcOrig = CreateCompatibleDC(hdcScr);
+        HGDIOBJ oldOrig = SelectObject(hdcOrig, hOrigBmp);
+        BitBlt(hdcTemp, 0, 0, origW, origH, hdcOrig, 0, 0, SRCCOPY);
+        SelectObject(hdcOrig, oldOrig);
+        DeleteDC(hdcOrig);
+        SelectObject(hdcTemp, oldTemp);
+        DeleteDC(hdcTemp);
+    }
+
+    // Point tab at the copy, restore strokes, and flatten to bake them onto the copy
+    t->hBitmap = hCopy;
+    t->strokes = origStrokes;
+    t->redoStack = origRedo;
+    FlattenToBitmap();
+
+    // Crop from the flattened copy
+    HBITMAP hCropped = CreateCompatibleBitmap(hdcScr, w, h);
+    {
+        HDC hdcSrc = CreateCompatibleDC(hdcScr);
+        HGDIOBJ oldSrc = SelectObject(hdcSrc, hCopy);
+        HDC hdcDst = CreateCompatibleDC(hdcScr);
+        HGDIOBJ oldDst = SelectObject(hdcDst, hCropped);
+        BitBlt(hdcDst, 0, 0, w, h, hdcSrc, x, y, SRCCOPY);
+        SelectObject(hdcDst, oldDst);
+        DeleteDC(hdcDst);
+        SelectObject(hdcSrc, oldSrc);
+        DeleteDC(hdcSrc);
+    }
+    DeleteObject(hCopy);
     ReleaseDC(nullptr, hdcScr);
-    DeleteObject(t->hBitmap);
-    t->hBitmap = hNew;
-    t->imgW = w;
-    t->imgH = h;
+
+    // Restore original tab unchanged
+    t->hBitmap = hOrigBmp;
+    t->imgW = origW;
+    t->imgH = origH;
+    t->strokes = origStrokes;
+    t->redoStack = origRedo;
     t->selIdx = -1;
+
+    // Add cropped result as a new tab
+    AddTab();
+    TabData* newTab = ActiveTab();
+    newTab->hBitmap = hCropped;
+    newTab->imgW = w;
+    newTab->imgH = h;
+    newTab->hasImage = true;
     FitToWindow();
     InvalidateRect(g.hwndCanvas, nullptr, FALSE);
     UpdateStatus();
+    UpdateTabControl();
 }
 
 static void ShowAboutDlg(HWND parent) {
