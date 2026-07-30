@@ -12,6 +12,7 @@
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
+#include <vfw.h>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -21,6 +22,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "vfw32.lib")
 
 using namespace Gdiplus;
 
@@ -110,7 +112,20 @@ struct App {
         bool enabled;
     };
     std::vector<TBButton> tbBtns;
+
+    bool isRecording = false;
+    int recFrameW = 0, recFrameH = 0;
+    int recMonX = 0, recMonY = 0;
+    int recFrameCount = 0;
+    PAVIFILE aviFile = nullptr;
+    PAVISTREAM aviStream = nullptr;
+    UINT_PTR recTimer = 0;
+    std::vector<BYTE> recBuf24;
+    CLSID recJpegClsid;
+    std::vector<BYTE> recJpegBuf;
+    int recRow24 = 0;
 };
+
 
 static App g;
 
@@ -384,11 +399,11 @@ static HBITMAP CaptureScreen() {
 }
 
 static void HideAndCapture(HWND hwnd) {
-    ShowWindow(hwnd, SW_MINIMIZE);
+    ShowWindow(hwnd, SW_HIDE);
     RedrawWindow(nullptr, nullptr, nullptr,
         RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE);
     DwmFlush();
-    Sleep(50);
+    Sleep(200);
 }
 
 static HBITMAP CaptureRegion(int x, int y, int w, int h) {
@@ -1181,6 +1196,8 @@ static const IconBtn ICON_BUTTONS[] = {
     { IDM_TOOL_CALLOUT,      0xE90A },
     { IDM_TOOL_HIGHLIGHTER,  0xE891 },
     { 0, 0 },
+    { IDM_RECORD_TOGGLE,     0xE768 },
+    { 0, 0 },
     { IDC_COLOR_BTN,          0xE790 },
     { IDC_PEN_WIDTH,          0xE8E3 },
     { IDM_EDIT_CROP,          0xE7A8 },
@@ -1213,8 +1230,234 @@ static const wchar_t* GetTooltipForId(int id) {
     case IDC_PEN_WIDTH:          return L"Pen Width";
     case IDM_EDIT_CROP:          return L"Crop Image";
     case IDM_EDIT_RESIZE:        return L"Resize Image";
+    case IDM_RECORD_TOGGLE:      return L"Start / Stop Screen Recording (2 fps)";
     default: return L"";
     }
+}
+
+static bool GetJpegClsid(CLSID* clsid) {
+    UINT num = 0, size = 0;
+    GetImageEncodersSize(&num, &size);
+    if (size == 0) return false;
+    std::vector<BYTE> buf(size);
+    ImageCodecInfo* info = (ImageCodecInfo*)buf.data();
+    GetImageEncoders(num, size, info);
+    for (UINT i = 0; i < num; i++) {
+        if (wcscmp(info[i].MimeType, L"image/jpeg") == 0) {
+            *clsid = info[i].Clsid;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void RecordFrame() {
+    if (!g.isRecording || !g.aviStream) return;
+
+    int vw = g.recFrameW;
+    int vh = g.recFrameH;
+    int vx = g.recMonX;
+    int vy = g.recMonY;
+
+    HDC hScr = GetDC(nullptr);
+    HDC hdc = CreateCompatibleDC(hScr);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = vw;
+    bmi.bmiHeader.biHeight = -vh;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = nullptr;
+    HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    if (hBmp) {
+        HGDIOBJ old = SelectObject(hdc, hBmp);
+        BitBlt(hdc, 0, 0, vw, vh, hScr, vx, vy, SRCCOPY);
+        SelectObject(hdc, old);
+        int row32 = vw * 4;
+        g.recBuf24.resize(g.recRow24 * vh);
+        BYTE* src = (BYTE*)pBits;
+        BYTE* dst = g.recBuf24.data();
+        for (int y = 0; y < vh; y++)
+            for (int x = 0; x < vw; x++) {
+                dst[y * g.recRow24 + x * 3 + 0] = src[y * row32 + x * 4 + 0];
+                dst[y * g.recRow24 + x * 3 + 1] = src[y * row32 + x * 4 + 1];
+                dst[y * g.recRow24 + x * 3 + 2] = src[y * row32 + x * 4 + 2];
+            }
+        BITMAPINFO bmi24 = {};
+        bmi24.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi24.bmiHeader.biWidth = vw;
+        bmi24.bmiHeader.biHeight = -vh;
+        bmi24.bmiHeader.biPlanes = 1;
+        bmi24.bmiHeader.biBitCount = 24;
+        bmi24.bmiHeader.biCompression = BI_RGB;
+        Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromBITMAPINFO(&bmi24, dst);
+        if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
+            IStream* stm = nullptr;
+            if (CreateStreamOnHGlobal(nullptr, TRUE, &stm) == S_OK) {
+                Gdiplus::EncoderParameters eps = {};
+                eps.Count = 1;
+                eps.Parameter[0].Guid = Gdiplus::EncoderQuality;
+                eps.Parameter[0].Type = EncoderParameterValueTypeLong;
+                eps.Parameter[0].NumberOfValues = 1;
+                ULONG quality = 85;
+                eps.Parameter[0].Value = &quality;
+                if (bmp->Save(stm, &g.recJpegClsid, &eps) == Gdiplus::Ok) {
+                    HGLOBAL hg = nullptr;
+                    if (GetHGlobalFromStream(stm, &hg) == S_OK) {
+                        void* jp = GlobalLock(hg);
+                        SIZE_T js = GlobalSize(hg);
+                        g.recJpegBuf.resize(js);
+                        memcpy(g.recJpegBuf.data(), jp, js);
+                        GlobalUnlock(hg);
+                        AVIStreamWrite(g.aviStream, g.recFrameCount++, 1, g.recJpegBuf.data(), (LONG)js, AVIIF_KEYFRAME, nullptr, nullptr);
+                    }
+                }
+                stm->Release();
+            }
+        }
+        delete bmp;
+        DeleteObject(hBmp);
+    }
+    DeleteDC(hdc);
+    ReleaseDC(nullptr, hScr);
+}
+
+static void StopRecording(HWND hwnd) {
+    if (g.recTimer) { KillTimer(hwnd, g.recTimer); g.recTimer = 0; }
+    g.recJpegBuf.clear();
+    if (g.aviStream) { AVIStreamRelease(g.aviStream); g.aviStream = nullptr; }
+    if (g.aviFile) { AVIFileRelease(g.aviFile); g.aviFile = nullptr; }
+    AVIFileExit();
+    g.isRecording = false;
+    g.recFrameCount = 0;
+    RebuildToolbar();
+    InvalidateRect(hwnd, nullptr, FALSE);
+    wchar_t msg[64];
+    swprintf_s(msg, L"Recording stopped");
+    SendMessage(g.hStatusbar, SB_SETTEXT, 0, (LPARAM)msg);
+}
+
+extern std::vector<RECT> g_monitorRects;
+extern BOOL CALLBACK MonitorEnumProc(HMONITOR, HDC, LPRECT, LPARAM);
+
+static void StartRecording(HWND hwnd) {
+    g_monitorRects.clear();
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, 0);
+    if (g_monitorRects.empty()) return;
+
+    int monCount = (int)g_monitorRects.size();
+    int selMon = 0;
+
+    if (monCount > 1) {
+        POINT pt = { 0, 0 };
+        ClientToScreen(hwnd, &pt);
+        RECT tbRc;
+        GetWindowRect(hwnd, &tbRc);
+        pt.x = tbRc.left + 200;
+        pt.y = tbRc.top + g.toolbarH + 2;
+
+        HMENU hMenu = CreatePopupMenu();
+        for (int i = 0; i < monCount && i < 8; i++) {
+            const RECT& mr = g_monitorRects[i];
+            wchar_t label[64];
+            wsprintfW(label, L"Monitor %d  (%dx%d)", i + 1,
+                mr.right - mr.left, mr.bottom - mr.top);
+            AppendMenuW(hMenu, MF_STRING, IDM_CAPTURE_MON1 + i, label);
+        }
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(hMenu, MF_STRING, IDM_CAPTURE_MON_ALL, L"All Monitors");
+        int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x, pt.y, 0, hwnd, nullptr);
+        DestroyMenu(hMenu);
+        if (cmd == 0) return;
+        if (cmd >= IDM_CAPTURE_MON1 && cmd <= IDM_CAPTURE_MON8) {
+            selMon = cmd - IDM_CAPTURE_MON1;
+            if (selMon >= monCount) return;
+        } else {
+            selMon = -1;
+        }
+    }
+
+    wchar_t f[MAX_PATH] = L"recording.avi";
+    OPENFILENAME of = {};
+    of.lStructSize = sizeof(of);
+    of.hwndOwner = hwnd;
+    of.lpstrFilter = L"AVI Video (*.avi)\0*.avi\0All Files (*.*)\0*.*\0";
+    of.lpstrFile = f;
+    of.nMaxFile = MAX_PATH;
+    of.Flags = OFN_OVERWRITEPROMPT;
+    of.lpstrDefExt = L"avi";
+    if (!GetSaveFileName(&of)) return;
+
+    if (selMon < 0) {
+        g.recMonX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        g.recMonY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        g.recFrameW = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        g.recFrameH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    } else {
+        const RECT& mr = g_monitorRects[selMon];
+        g.recMonX = mr.left;
+        g.recMonY = mr.top;
+        g.recFrameW = mr.right - mr.left;
+        g.recFrameH = mr.bottom - mr.top;
+    }
+
+    AVIFileInit();
+    HRESULT hr = AVIFileOpen(&g.aviFile, f, OF_WRITE | OF_CREATE, nullptr);
+    if (hr != AVIERR_OK) {
+        AVIFileExit();
+        MessageBox(hwnd, L"Failed to create AVI file.", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    AVISTREAMINFO si = {};
+    si.fccType = streamtypeVIDEO;
+    si.fccHandler = 0;
+    si.dwScale = 1;
+    si.dwRate = 2;
+    si.dwSuggestedBufferSize = g.recFrameW * g.recFrameH * 4;
+    SetRect(&si.rcFrame, 0, 0, g.recFrameW, g.recFrameH);
+    hr = AVIFileCreateStream(g.aviFile, &g.aviStream, &si);
+    if (hr != AVIERR_OK) {
+        AVIFileRelease(g.aviFile); g.aviFile = nullptr;
+        AVIFileExit();
+        MessageBox(hwnd, L"Failed to create video stream.", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    g.recRow24 = ((g.recFrameW * 24 + 31) / 32) * 4;
+    GetJpegClsid(&g.recJpegClsid);
+
+    BITMAPINFOHEADER bmih = {};
+    bmih.biSize = sizeof(BITMAPINFOHEADER);
+    bmih.biWidth = g.recFrameW;
+    bmih.biHeight = g.recFrameH;
+    bmih.biPlanes = 1;
+    bmih.biBitCount = 24;
+    bmih.biCompression = mmioFOURCC('M','J','P','G');
+    bmih.biSizeImage = 0;
+
+    hr = AVIStreamSetFormat(g.aviStream, 0, &bmih, sizeof(BITMAPINFOHEADER));
+    if (hr != AVIERR_OK) {
+        AVIStreamRelease(g.aviStream); g.aviStream = nullptr;
+        AVIFileRelease(g.aviFile); g.aviFile = nullptr;
+        AVIFileExit();
+        MessageBox(hwnd, L"Failed to set video format.", L"Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    g.isRecording = true;
+    g.recFrameCount = 0;
+    g.recTimer = SetTimer(hwnd, 3001, 500, nullptr);
+    RecordFrame();
+    RebuildToolbar();
+    InvalidateRect(hwnd, nullptr, FALSE);
+    wchar_t msg[64];
+    swprintf_s(msg, L"Recording started (2 fps) — %dx%d", g.recFrameW, g.recFrameH);
+    SendMessage(g.hStatusbar, SB_SETTEXT, 0, (LPARAM)msg);
 }
 
 static void RebuildToolbar() {
@@ -1339,7 +1582,9 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
                     MoveToEx(hdc, b.x + b.w / 2 - 8, b.y + b.h / 2 + 5, nullptr); LineTo(hdc, b.x + b.w / 2 + 8, b.y + b.h / 2 + 5);
                     SelectObject(hdc, op2); DeleteObject(pen);
                 } else {
-                    DrawFontIcon(hdc, b.x + b.w / 2, b.y + b.h / 2, ICON_BUTTONS[fi].glyph, iconColor);
+                    wchar_t glyph = ICON_BUTTONS[fi].glyph;
+                    if (b.id == IDM_RECORD_TOGGLE && g.isRecording) glyph = 0xE71A;
+                    DrawFontIcon(hdc, b.x + b.w / 2, b.y + b.h / 2, glyph, iconColor);
                 }
                 break;
             }
@@ -2018,7 +2263,7 @@ static int g_overlayVirtX = 0, g_overlayVirtY = 0;
 static POINT g_overlayStart = {};
 static POINT g_overlayCur = {};
 static bool g_overlayDragging = false;
-static std::vector<RECT> g_monitorRects;
+std::vector<RECT> g_monitorRects;
 
 static void Overlay_Finish(HWND hwndMain, bool ok) {
     if (g_overlayScreenBmp) { DeleteObject(g_overlayScreenBmp); g_overlayScreenBmp = nullptr; }
@@ -2030,9 +2275,9 @@ static void Overlay_Finish(HWND hwndMain, bool ok) {
         int y = min(g_overlayStart.y, g_overlayCur.y) + g_overlayVirtY;
         int w = abs(g_overlayCur.x - g_overlayStart.x);
         int h = abs(g_overlayCur.y - g_overlayStart.y);
-        ShowWindow(hwndMain, SW_RESTORE);
         if (w > 2 && h > 2) {
             HBITMAP hb = CaptureRegion(x, y, w, h);
+            ShowWindow(hwndMain, SW_SHOW);
             if (hb) {
                 FlattenToBitmap();
                 SetImage(hb, w, h);
@@ -2040,14 +2285,16 @@ static void Overlay_Finish(HWND hwndMain, bool ok) {
                 InvalidateRect(g.hwndCanvas, nullptr, FALSE);
                 UpdateStatus();
             }
+        } else {
+            ShowWindow(hwndMain, SW_SHOW);
         }
     } else {
-        ShowWindow(hwndMain, SW_RESTORE);
+        ShowWindow(hwndMain, SW_SHOW);
     }
     InvalidateRect(hwndMain, nullptr, FALSE);
 }
 
-static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lprcMonitor, LPARAM dwData) {
+BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lprcMonitor, LPARAM dwData) {
     (void)hMon; (void)hdcMon; (void)dwData;
     RECT rc = *lprcMonitor;
     g_monitorRects.push_back(rc);
@@ -2290,7 +2537,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 CloseTab(id - IDC_TAB_CLOSE);
             }
             break;
-        case IDM_FILE_EXIT:     PostQuitMessage(0); break;
+        case IDM_FILE_EXIT:
+            if (g.isRecording) StopRecording(hwnd);
+            PostQuitMessage(0); break;
 
         case IDM_EDIT_UNDO:
             if (T && !T->strokes.empty()) {
@@ -2383,7 +2632,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     HBITMAP hb = CaptureScreen();
                     int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
                     int ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                    ShowWindow(hwnd, SW_RESTORE);
+                    ShowWindow(hwnd, SW_SHOW);
                     if (hb) {
                         SetImage(hb, cw, ch);
                         FitToWindow();
@@ -2397,7 +2646,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         int mw = mr.right - mr.left, mh = mr.bottom - mr.top;
                         HideAndCapture(hwnd);
                         HBITMAP hb = CaptureRegion(mx, my, mw, mh);
-                        ShowWindow(hwnd, SW_RESTORE);
+                        ShowWindow(hwnd, SW_SHOW);
                         if (hb) {
                             SetImage(hb, mw, mh);
                             FitToWindow();
@@ -2411,7 +2660,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 HBITMAP hb = CaptureScreen();
                 int cw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
                 int ch = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                ShowWindow(hwnd, SW_RESTORE);
+                ShowWindow(hwnd, SW_SHOW);
                 if (hb) {
                     SetImage(hb, cw, ch);
                     FitToWindow();
@@ -2478,6 +2727,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case IDM_HELP_ABOUT: ShowAboutDlg(hwnd); break;
+
+        case IDM_RECORD_TOGGLE:
+            if (g.isRecording) StopRecording(hwnd);
+            else StartRecording(hwnd);
+            break;
         }
 
         if (id >= IDM_COLOR_BLACK && id <= IDM_COLOR_CUSTOM && T && T->selIdx >= 0 && T->selIdx < (int)T->strokes.size()) {
@@ -2578,7 +2832,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
 
+    case WM_TIMER:
+        if (wp == 3001) { RecordFrame(); return 0; }
+        break;
+
     case WM_DESTROY:
+        if (g.isRecording) {
+            if (g.recTimer) KillTimer(hwnd, g.recTimer);
+            if (g.aviStream) AVIStreamRelease(g.aviStream);
+            if (g.aviFile) AVIFileRelease(g.aviFile);
+            AVIFileExit();
+            g.isRecording = false;
+        }
         for (auto& tab : g.tabs)
             if (tab.hBitmap) DeleteObject(tab.hBitmap);
         PostQuitMessage(0);

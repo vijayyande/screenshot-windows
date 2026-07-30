@@ -16,6 +16,7 @@ target_link_libraries(ScreenCapture PRIVATE
     shell32
     comdlg32
     gdiplus
+    vfw32
 )
 
 target_compile_definitions(ScreenCapture PRIVATE

@@ -290,6 +290,15 @@ CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows K
 CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\GdiplusBitmap.h"
 CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\GdiplusImageCodec.h"
 CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\poppack.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\vfw.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\pshpack8.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\mmreg.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\pshpack1.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\poppack.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\msacm.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\pshpack1.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\poppack.h"
+CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\poppack.h"
 CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\vector"
 CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\yvals_core.h"
 CMakeFiles\ScreenCapture.dir\src\main.cpp.obj: "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\xkeycheck.h"
@@ -435,6 +444,8 @@ D:\Projects\temp\screenshot\src\resource.h:
 "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\sdv_driverspecs.h":
 
 "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\winnt.h":
+
+"C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\msacm.h":
 
 "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\ucrt\corecrt_wctype.h":
 
@@ -803,6 +814,10 @@ D:\Projects\temp\screenshot\src\resource.h:
 "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\GdiplusFont.h":
 
 "C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\GdiplusBitmap.h":
+
+"C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\um\vfw.h":
+
+"C:\Program Files (x86)\Windows Kits\10\include\10.0.26100.0\shared\mmreg.h":
 
 "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\include\yvals_core.h":
 

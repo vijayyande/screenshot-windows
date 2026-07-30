@@ -291,6 +291,15 @@ CMakeFiles/ScreenCapture.dir/src/main.cpp.obj
  C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/um/GdiplusBitmap.h
  C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/um/GdiplusImageCodec.h
  C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/poppack.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/um/vfw.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/pshpack8.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/mmreg.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/pshpack1.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/poppack.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/um/msacm.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/pshpack1.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/poppack.h
+ C:/Program Files (x86)/Windows Kits/10/include/10.0.26100.0/shared/poppack.h
  C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include/vector
  C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include/yvals_core.h
  C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/include/xkeycheck.h

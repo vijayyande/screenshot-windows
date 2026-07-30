@@ -93,3 +93,5 @@
 #define IDI_TOOL_TEXT       5006
 #define IDI_TOOL_ARROW      5007
 #define IDI_TOOL_FILL       5008
+
+#define IDM_RECORD_TOGGLE   2801
