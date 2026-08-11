@@ -403,7 +403,7 @@ static void HideAndCapture(HWND hwnd) {
     RedrawWindow(nullptr, nullptr, nullptr,
         RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE);
     DwmFlush();
-    Sleep(200);
+    Sleep(1000);
 }
 
 static HBITMAP CaptureRegion(int x, int y, int w, int h) {
