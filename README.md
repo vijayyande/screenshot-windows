@@ -20,6 +20,7 @@ A lightweight screen capture and annotation tool for Windows.
 *   Fullscreen capture (F11) — grabs your entire screen (including multi-monitor setups)
 *   Region capture (F12) — drag to select exactly the area you want, with a dimmed preview to help you see your selection
 *   Screen recording
+*   Capture scrolling window
 
 **Annotate with 11 Tools**
 
