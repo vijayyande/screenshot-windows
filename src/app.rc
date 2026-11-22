@@ -36,6 +36,7 @@ BEGIN
     BEGIN
         MENUITEM "Fullscreen (F11)",          IDM_CAPTURE_FULLSCREEN
         MENUITEM "Region (F12)",              IDM_CAPTURE_REGION
+        MENUITEM "Scrolling (F10)",           IDM_CAPTURE_SCROLLING
     END
     POPUP "&Tools"
     BEGIN

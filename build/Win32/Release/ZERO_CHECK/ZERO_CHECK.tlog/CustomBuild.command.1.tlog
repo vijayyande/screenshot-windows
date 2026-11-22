@@ -1,0 +1,10 @@
+^D:\PROJECTS\TEMP\SCREENSHOT\BUILD\CMAKEFILES\5613AE537B9ECCA365C6959FE2E375EC\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/Projects/temp/screenshot -BD:/Projects/temp/screenshot/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/Projects/temp/screenshot/build/ScreenCapture.slnx
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

@@ -17,6 +17,7 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
+#include <climits>
 #include "resource.h"
 
 #pragma comment(lib, "comctl32.lib")
@@ -124,6 +125,13 @@ struct App {
     CLSID recJpegClsid;
     std::vector<BYTE> recJpegBuf;
     int recRow24 = 0;
+
+    bool isScrollCapturing = false;
+    HWND scrollCapTarget = nullptr;
+    std::vector<HBITMAP> scrollCapFrames;
+    std::vector<int> scrollCapFrameY;
+    std::vector<int> scrollCapFrameScroll;
+    int scrollCapClientW = 0, scrollCapClientH = 0;
 };
 
 
@@ -152,6 +160,176 @@ static double PtSegDistSq(POINT p, POINT a, POINT b) {
     return ex2 * ex2 + ey2 * ey2;
 }
 
+// ---------------------------------------------------------------------------
+// Callout: one layout (in image coordinates) shared by drawing on screen,
+// saving/flattening, hit testing and the selection box, so what you see is
+// exactly what gets saved.
+// ---------------------------------------------------------------------------
+struct CalloutLayout {
+    RECT bubble = {};                 // image coords
+    int pad = 6;
+    int lineH = 0;
+    int radius = 8;
+    std::vector<std::wstring> lines;  // already word-wrapped
+    bool hasArrow = false;
+    POINT tail = {};                  // where the arrow leaves the bubble
+    POINT tip = {};                   // arrow tip (the pointed-at spot)
+};
+
+static const int CALLOUT_MAX_TEXT_W = 320;
+
+static HFONT CreateAnnotFont(const std::wstring& name, int pixelHeight) {
+    return CreateFont(-max(1, pixelHeight), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, name.c_str());
+}
+
+static void ComputeCalloutLayout(const Stroke& s, CalloutLayout& L) {
+    int fs = max(8, s.fontSize);
+    HDC hdc = CreateCompatibleDC(nullptr);
+    HFONT hf = CreateAnnotFont(s.fontName, fs);
+    HFONT old = (HFONT)SelectObject(hdc, hf);
+    TEXTMETRIC tm = {};
+    GetTextMetrics(hdc, &tm);
+    L.lineH = max(1, (int)(tm.tmHeight + tm.tmExternalLeading));
+    L.pad = max(6, fs / 3);
+    L.radius = max(6, fs / 2);
+    L.lines.clear();
+
+    auto width = [&](const std::wstring& str) {
+        SIZE sz = { 0, 0 };
+        if (!str.empty()) GetTextExtentPoint32(hdc, str.c_str(), (int)str.size(), &sz);
+        return (int)sz.cx;
+    };
+
+    // Greedy word wrap per paragraph; very long words are broken by character.
+    std::wstring text = s.text;
+    size_t p = 0;
+    int maxW = 0;
+    while (true) {
+        size_t nl = text.find(L'\n', p);
+        std::wstring para = text.substr(p, nl == std::wstring::npos ? std::wstring::npos : nl - p);
+        if (!para.empty() && para.back() == L'\r') para.pop_back();
+        std::wstring line;
+        size_t i = 0;
+        while (i <= para.size()) {
+            size_t sp = para.find(L' ', i);
+            std::wstring word = para.substr(i, sp == std::wstring::npos ? std::wstring::npos : sp - i);
+            std::wstring cand = line.empty() ? word : line + L" " + word;
+            if (width(cand) <= CALLOUT_MAX_TEXT_W || line.empty()) {
+                if (line.empty() && width(word) > CALLOUT_MAX_TEXT_W) {
+                    // break a long word
+                    std::wstring chunk;
+                    for (wchar_t ch : word) {
+                        if (!chunk.empty() && width(chunk + ch) > CALLOUT_MAX_TEXT_W) {
+                            L.lines.push_back(chunk);
+                            maxW = max(maxW, width(chunk));
+                            chunk.clear();
+                        }
+                        chunk += ch;
+                    }
+                    line = chunk;
+                } else {
+                    line = cand;
+                }
+            } else {
+                L.lines.push_back(line);
+                maxW = max(maxW, width(line));
+                line = word;
+            }
+            if (sp == std::wstring::npos) break;
+            i = sp + 1;
+        }
+        L.lines.push_back(line);
+        maxW = max(maxW, width(line));
+        if (nl == std::wstring::npos) break;
+        p = nl + 1;
+    }
+    SelectObject(hdc, old);
+    DeleteObject(hf);
+    DeleteDC(hdc);
+
+    int bw = max(maxW, fs) + L.pad * 2;
+    int bh = (int)L.lines.size() * L.lineH + L.pad * 2;
+    L.bubble = { s.endPt.x - bw / 2, s.endPt.y - bh / 2,
+                 s.endPt.x - bw / 2 + bw, s.endPt.y - bh / 2 + bh };
+
+    // Arrow from the bubble edge (on the line toward the tip) to the tip.
+    L.tip = s.startPt;
+    POINT tipPt = s.startPt;
+    L.hasArrow = !PtInRect(&L.bubble, tipPt);
+    if (L.hasArrow) {
+        double cx = s.endPt.x, cy = s.endPt.y;
+        double dx = s.startPt.x - cx, dy = s.startPt.y - cy;
+        double hw = bw / 2.0, hh = bh / 2.0;
+        double tx = dx != 0 ? hw / fabs(dx) : 1e18;
+        double ty = dy != 0 ? hh / fabs(dy) : 1e18;
+        double tt = min(tx, ty);
+        L.tail = { (int)lround(cx + dx * tt), (int)lround(cy + dy * tt) };
+    }
+}
+
+// Draws a callout. Image point (x, y) maps to (x * zoom + ox, y * zoom + oy).
+static void DrawCallout(HDC hdc, const Stroke& s, double zoom, double ox, double oy) {
+    CalloutLayout L;
+    ComputeCalloutLayout(s, L);
+    auto X = [&](double x) { return (int)lround(x * zoom + ox); };
+    auto Y = [&](double y) { return (int)lround(y * zoom + oy); };
+    int pw = max(1, (int)lround(max(1, s.penWidth) * zoom));
+
+    HPEN pen = CreatePen(PS_SOLID, pw, s.color);
+    HBRUSH colorBr = CreateSolidBrush(s.color);
+    HBRUSH whiteBr = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH oldBr = (HBRUSH)SelectObject(hdc, colorBr);
+
+    // Arrow first, so the bubble covers the start of the shaft.
+    if (L.hasArrow) {
+        double tx = L.tip.x, ty = L.tip.y;
+        double dx = tx - L.tail.x, dy = ty - L.tail.y;
+        double len = sqrt(dx * dx + dy * dy);
+        if (len > 0.5) {
+            double nx = dx / len, ny = dy / len;
+            double hl = min(len, max(10.0, 3.0 * max(1, s.penWidth) + 6.0));
+            double hw = hl * 0.55;
+            double bx = tx - nx * hl, by = ty - ny * hl;   // base of the head
+            MoveToEx(hdc, X(L.tail.x), Y(L.tail.y), nullptr);
+            LineTo(hdc, X(bx + nx * hl * 0.3), Y(by + ny * hl * 0.3));
+            POINT head[3] = {
+                { X(tx), Y(ty) },
+                { X(bx + ny * hw), Y(by - nx * hw) },
+                { X(bx - ny * hw), Y(by + nx * hw) }
+            };
+            Polygon(hdc, head, 3);
+        }
+    }
+
+    SelectObject(hdc, whiteBr);
+    int r = max(2, (int)lround(L.radius * zoom));
+    RoundRect(hdc, X(L.bubble.left), Y(L.bubble.top), X(L.bubble.right), Y(L.bubble.bottom), r, r);
+
+    int fsPx = (int)lround(max(8, s.fontSize) * zoom);
+    if (fsPx >= 1) {
+        HFONT hf = CreateAnnotFont(s.fontName, fsPx);
+        HFONT oldF = (HFONT)SelectObject(hdc, hf);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, s.color);
+        for (size_t i = 0; i < L.lines.size(); i++) {
+            const std::wstring& ln = L.lines[i];
+            if (ln.empty()) continue;
+            TextOut(hdc, X(L.bubble.left + L.pad), Y(L.bubble.top + L.pad + (int)i * L.lineH),
+                    ln.c_str(), (int)ln.size());
+        }
+        SelectObject(hdc, oldF);
+        DeleteObject(hf);
+    }
+
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBr);
+    DeleteObject(pen);
+    DeleteObject(colorBr);
+    DeleteObject(whiteBr);
+}
+
 static void GetBBox(const Stroke& s, POINT& tl, POINT& br) {
     if (s.tool == Tool::Pen || s.tool == Tool::Eraser || s.tool == Tool::Highlighter) {
         if (s.points.empty()) { tl = br = { 0,0 }; return; }
@@ -175,6 +353,15 @@ static void GetBBox(const Stroke& s, POINT& tl, POINT& br) {
         int pad = 6;
         tl.x = s.startPt.x - pad; tl.y = s.startPt.y - fs - pad;
         br.x = s.startPt.x + sz.cx + pad; br.y = s.startPt.y + pad;
+    } else if (s.tool == Tool::Callout) {
+        CalloutLayout L;
+        ComputeCalloutLayout(s, L);
+        tl = { L.bubble.left, L.bubble.top };
+        br = { L.bubble.right, L.bubble.bottom };
+        if (L.hasArrow) {
+            tl.x = min(tl.x, L.tip.x); tl.y = min(tl.y, L.tip.y);
+            br.x = max(br.x, L.tip.x); br.y = max(br.y, L.tip.y);
+        }
     } else {
         tl.x = min(s.startPt.x, s.endPt.x); tl.y = min(s.startPt.y, s.endPt.y);
         br.x = max(s.startPt.x, s.endPt.x); br.y = max(s.startPt.y, s.endPt.y);
@@ -246,27 +433,16 @@ static int HitTestShape(POINT imgPt) {
             break;
         }
         case Tool::Callout: {
-            double dSq = PtSegDistSq(imgPt, s.startPt, s.endPt);
-            double penTol = max(tol, s.penWidth / 2.0 + tol);
-            if (dSq <= penTol * penTol) return i;
-            HDC hdc = CreateCompatibleDC(nullptr);
-            HFONT hf = CreateFont(-s.fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
-                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
-            HFONT old = (HFONT)SelectObject(hdc, hf);
-            int pad = 6;
-            int maxBubbleW = 300;
-            RECT rcCalc = { 0, 0, maxBubbleW, 10000 };
-            if (!s.text.empty())
-                DrawText(hdc, s.text.c_str(), (int)s.text.size(), &rcCalc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
-            SelectObject(hdc, old);
-            DeleteObject(hf);
-            DeleteDC(hdc);
-            int bw = rcCalc.right + pad * 2;
-            int bh = rcCalc.bottom + pad * 2;
-            RECT br2 = { s.endPt.x - bw / 2 - 2, s.endPt.y - bh / 2 - 2,
-                         s.endPt.x + bw / 2 + 2, s.endPt.y + bh / 2 + 2 };
-            if (imgPt.x >= br2.left && imgPt.x <= br2.right && imgPt.y >= br2.top && imgPt.y <= br2.bottom)
-                return i;
+            CalloutLayout L;
+            ComputeCalloutLayout(s, L);
+            RECT bb = L.bubble;
+            InflateRect(&bb, 3, 3);
+            if (PtInRect(&bb, imgPt)) return i;
+            if (L.hasArrow) {
+                double dSq = PtSegDistSq(imgPt, L.tail, L.tip);
+                double penTol = max(tol, s.penWidth / 2.0 + tol);
+                if (dSq <= penTol * penTol) return i;
+            }
             break;
         }
         default: break;
@@ -308,8 +484,11 @@ static void ResizeStroke(int idx, int handle, POINT newImgPt) {
     if (!t || idx < 0 || idx >= (int)t->strokes.size()) return;
     auto& s = t->strokes[idx];
     const auto& bak = t->selBackup;
+    // Start from the box the shape had when the drag began, so edges that
+    // aren't being dragged stay put (shapes like callouts don't fill their box
+    // exactly, which made them drift when based on the current box).
     POINT tl, br;
-    GetBBox(s, tl, br);
+    GetBBox(bak, tl, br);
 
     POINT newTl = tl, newBr = br;
     switch (handle) {
@@ -342,6 +521,14 @@ static void ResizeStroke(int idx, int handle, POINT newImgPt) {
         int dy = newTl.y - origTl.y;
         s.startPt.x = bak.startPt.x + dx;
         s.startPt.y = bak.startPt.y + dy;
+    } else if (s.tool == Tool::Callout) {
+        // Stretch the arrow with the box and scale the text with it.
+        s.startPt.x = newTl.x + (int)lround((bak.startPt.x - origTl.x) * sx);
+        s.startPt.y = newTl.y + (int)lround((bak.startPt.y - origTl.y) * sy);
+        s.endPt.x = newTl.x + (int)lround((bak.endPt.x - origTl.x) * sx);
+        s.endPt.y = newTl.y + (int)lround((bak.endPt.y - origTl.y) * sy);
+        double fscale = sqrt(fabs(sx * sy));
+        s.fontSize = max(8, min(200, (int)lround(bak.fontSize * fscale)));
     } else {
         s.startPt.x = newTl.x + (int)((bak.startPt.x - origTl.x) * sx);
         s.startPt.y = newTl.y + (int)((bak.startPt.y - origTl.y) * sy);
@@ -426,6 +613,830 @@ static HBITMAP CaptureRegion(int x, int y, int w, int h) {
     return hBmp;
 }
 
+static void FlattenToBitmap();
+static void SetImage(HBITMAP hBmp, int w, int h);
+static void FitToWindow();
+static void UpdateStatus();
+
+static HBITMAP CaptureWindowClient(HWND frame, void** outBits = nullptr, bool forceScreen = false) {
+    if (!frame) return nullptr;
+    RECT wr, cr;
+    GetWindowRect(frame, &wr);
+    GetClientRect(frame, &cr);
+    int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
+    int cw = cr.right, ch = cr.bottom;
+    if (cw <= 0 || ch <= 0) return nullptr;
+
+    POINT cTL = { 0, 0 };
+    ClientToScreen(frame, &cTL);
+    int ox = cTL.x - wr.left;
+    int oy = cTL.y - wr.top;
+
+    HDC hdcScreen = GetDC(nullptr);
+
+    HDC hdcTmp = CreateCompatibleDC(hdcScreen);
+    BITMAPINFO bmiFull = {};
+    bmiFull.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmiFull.bmiHeader.biWidth = ww;
+    bmiFull.bmiHeader.biHeight = -wh;
+    bmiFull.bmiHeader.biPlanes = 1;
+    bmiFull.bmiHeader.biBitCount = 32;
+    bmiFull.bmiHeader.biCompression = BI_RGB;
+    void* pvFull = nullptr;
+    HBITMAP hBmpFull = CreateDIBSection(hdcTmp, &bmiFull, DIB_RGB_COLORS, &pvFull, nullptr, 0);
+    HGDIOBJ oldTmp = SelectObject(hdcTmp, hBmpFull);
+
+    if (forceScreen) {
+        HBITMAP hScrFull = CaptureRegion(wr.left, wr.top, ww, wh);
+        if (hScrFull) {
+            HDC hdcScr = CreateCompatibleDC(nullptr);
+            HGDIOBJ oldScr = SelectObject(hdcScr, hScrFull);
+            BitBlt(hdcTmp, 0, 0, ww, wh, hdcScr, 0, 0, SRCCOPY);
+            SelectObject(hdcScr, oldScr);
+            DeleteDC(hdcScr);
+            DeleteObject(hScrFull);
+        }
+    } else {
+        BOOL ok = PrintWindow(frame, hdcTmp, PW_RENDERFULLCONTENT);
+        if (!ok) {
+            HDC hdcWnd = GetDC(frame);
+            BitBlt(hdcTmp, 0, 0, ww, wh, hdcWnd, 0, 0, SRCCOPY);
+            ReleaseDC(frame, hdcWnd);
+        }
+    }
+
+    HDC hdcDst = CreateCompatibleDC(hdcScreen);
+    BITMAPINFO bmiClient = {};
+    bmiClient.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmiClient.bmiHeader.biWidth = cw;
+    bmiClient.bmiHeader.biHeight = -ch;
+    bmiClient.bmiHeader.biPlanes = 1;
+    bmiClient.bmiHeader.biBitCount = 32;
+    bmiClient.bmiHeader.biCompression = BI_RGB;
+    void* pvClient = nullptr;
+    HBITMAP hBmpClient = CreateDIBSection(hdcDst, &bmiClient, DIB_RGB_COLORS, &pvClient, nullptr, 0);
+    HGDIOBJ oldDst = SelectObject(hdcDst, hBmpClient);
+    BitBlt(hdcDst, 0, 0, cw, ch, hdcTmp, ox, oy, SRCCOPY);
+
+    long long ink = 0;
+    const BYTE* px = (const BYTE*)pvClient;
+    for (long long i = 0; i < (long long)ch * cw; i++)
+        ink += 765 - (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2]);
+    if (ink < (long long)ch * max(4, cw / 20)) {
+        HBITMAP hScrBmp = CaptureRegion(cTL.x, cTL.y, cw, ch);
+        if (hScrBmp) {
+            HDC hdcScr = CreateCompatibleDC(nullptr);
+            HGDIOBJ oldScr = SelectObject(hdcScr, hScrBmp);
+            BitBlt(hdcDst, 0, 0, cw, ch, hdcScr, 0, 0, SRCCOPY);
+            SelectObject(hdcScr, oldScr);
+            DeleteDC(hdcScr);
+            DeleteObject(hScrBmp);
+        }
+    }
+
+    SelectObject(hdcTmp, oldTmp);
+    SelectObject(hdcDst, oldDst);
+    DeleteDC(hdcTmp);
+    DeleteDC(hdcDst);
+    ReleaseDC(nullptr, hdcScreen);
+    DeleteObject(hBmpFull);
+
+    if (outBits) *outBits = pvClient;
+    return hBmpClient;
+}
+
+static HWND FindScrollableChild(HWND frame) {
+    struct { int area; HWND hwnd; } data = { 0, nullptr };
+    EnumChildWindows(frame, [](HWND hwnd, LPARAM lParam) -> BOOL {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int area = (rc.right - rc.left) * (rc.bottom - rc.top);
+        LONG style = GetWindowLong(hwnd, GWL_STYLE);
+        auto* d = (decltype(data)*)lParam;
+        if (area > 1000 && (style & (WS_VSCROLL | WS_HSCROLL)) && area > d->area) {
+            d->area = area;
+            d->hwnd = hwnd;
+        }
+        return TRUE;
+    }, (LPARAM)&data);
+    if (data.hwnd) return data.hwnd;
+    data.area = 0;
+    data.hwnd = nullptr;
+    EnumChildWindows(frame, [](HWND hwnd, LPARAM lParam) -> BOOL {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int area = (rc.right - rc.left) * (rc.bottom - rc.top);
+        auto* d = (decltype(data)*)lParam;
+        if (area > 5000 && area > d->area) {
+            d->area = area;
+            d->hwnd = hwnd;
+        }
+        return TRUE;
+    }, (LPARAM)&data);
+    return data.hwnd ? data.hwnd : frame;
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling capture
+//
+// Each captured frame is reduced to a per-row "signature" (column-bucket sums).
+// Consecutive frames are compared to find the exact pixel shift of the
+// scrolling content, ignoring fixed bands (toolbars, sticky headers, status
+// bars) at the top/bottom and the scrollbar column. The final image is built
+// from those measured shifts instead of guessed scroll amounts.
+// ---------------------------------------------------------------------------
+
+struct ShiftResult {
+    bool ok = false;     // a consistent shift was found (0 = no scroll)
+    int shift = 0;       // rows the content moved up
+    int topStatic = 0;   // fixed rows at the top
+    int bottomStatic = 0;// fixed rows at the bottom
+};
+
+static int GetWindowDpiSafe(HWND hwnd) {
+    typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
+    static PFN_GetDpiForWindow p = (PFN_GetDpiForWindow)GetProcAddress(
+        GetModuleHandle(L"user32.dll"), "GetDpiForWindow");
+    UINT d = p ? p(hwnd) : 0;
+    return d ? (int)d : 96;
+}
+
+static bool SigRowsEqual(const int* a, const int* b, int nb, int tol) {
+    for (int k = 0; k < nb; k++) {
+        int d = a[k] - b[k];
+        if (d < -tol || d > tol) return false;
+    }
+    return true;
+}
+
+// Finds how far the content moved up between frame A and frame B
+// (32bpp top-down pixels, same size). Only columns that actually change
+// between the two frames are compared, so window borders, translucent
+// (Mica) frames, static sidebars and blank margins are ignored. The shift is
+// the one giving the longest consistent run of matching rows, so a changing
+// title bar, hover highlight or small animation doesn't break the match.
+static ShiftResult FindScrollShift(const BYTE* A, const BYTE* B, int w, int h,
+                                   int x0, int x1, int expected) {
+    ShiftResult res;
+    x0 = max(0, x0);
+    x1 = min(w, x1);
+    if (h < 48 || x1 - x0 < 8) return res;
+    const size_t stride = (size_t)w * 4;
+
+    // 1. Columns whose pixels differ between the frames
+    std::vector<char> colAct(w, 0);
+    for (int y = 0; y < h; y++) {
+        const BYTE* pa = A + (size_t)y * stride;
+        const BYTE* pb = B + (size_t)y * stride;
+        for (int x = x0; x < x1; x++) {
+            if (colAct[x]) continue;
+            const BYTE* qa = pa + x * 4;
+            const BYTE* qb = pb + x * 4;
+            int d = abs(qa[0] - qb[0]) + abs(qa[1] - qb[1]) + abs(qa[2] - qb[2]);
+            if (d > 60) colAct[x] = 1;   // ignore faint noise (translucent frames)
+        }
+    }
+    std::vector<int> cols;
+    for (int x = x0; x < x1; x++)
+        if (colAct[x]) cols.push_back(x);
+    if ((int)cols.size() < 8) {
+        res.ok = true; res.shift = 0; res.topStatic = h; res.bottomStatic = 0;
+        return res;
+    }
+
+    // 2. Row signatures over the changing columns only
+    const int nAct = (int)cols.size();
+    const int nb = min(64, max(8, nAct / 6));
+    const int bw = max(1, nAct / nb);
+    std::vector<int> SA((size_t)h * nb, 0), SB((size_t)h * nb, 0);
+    for (int y = 0; y < h; y++) {
+        const BYTE* pa = A + (size_t)y * stride;
+        const BYTE* pb = B + (size_t)y * stride;
+        int* ra = &SA[(size_t)y * nb];
+        int* rb = &SB[(size_t)y * nb];
+        for (int i = 0; i < nAct; i++) {
+            int k = (int)((long long)i * nb / nAct);
+            const BYTE* qa = pa + cols[i] * 4;
+            const BYTE* qb = pb + cols[i] * 4;
+            ra[k] += qa[0] + qa[1] * 3 + qa[2] * 2;
+            rb[k] += qb[0] + qb[1] * 3 + qb[2] * 2;
+        }
+    }
+    auto rowA = [&](int y) { return &SA[(size_t)y * nb]; };
+    auto rowB = [&](int y) { return &SB[(size_t)y * nb]; };
+
+    for (int pass = 0; pass < 2; pass++) {
+        // pass 0: exact, pass 1: tolerant (smooth scrolling, dithering)
+        const int tol = (pass == 0) ? 0 : bw * 6 * 10 + 6 * 60;
+        const int infoThresh = max(tol, bw * 6 * 3);
+
+        // Fixed bands at top and bottom
+        int t = 0;
+        while (t < h && SigRowsEqual(rowA(t), rowB(t), nb, tol)) t++;
+        int bs = 0;
+        while (bs < h - t && SigRowsEqual(rowA(h - 1 - bs), rowB(h - 1 - bs), nb, tol)) bs++;
+        if (h - t - bs < 8) {
+            res.ok = true; res.shift = 0; res.topStatic = t; res.bottomStatic = bs;
+            return res;
+        }
+
+        // Rows with enough detail to be matched unambiguously
+        auto informative = [&](const int* r) {
+            int mn = INT_MAX, mx = INT_MIN;
+            for (int k = 0; k < nb; k++) { mn = min(mn, r[k]); mx = max(mx, r[k]); }
+            return (mx - mn) > infoThresh;
+        };
+        std::vector<char> infoA(h), infoB(h);
+        for (int y = 0; y < h; y++) {
+            infoA[y] = informative(rowA(y)) ? 1 : 0;
+            infoB[y] = informative(rowB(y)) ? 1 : 0;
+        }
+
+        // 3. For each shift, the best run of matching rows (+1 match, -3 mismatch)
+        // Only rows inside the scrolling band are compared, so a fixed header
+        // or footer can't make "no scroll" look like the best match.
+        int bestScore = -1, bestShift = -1;
+        const int bandEnd = h - bs;
+        for (int d = 0; d <= bandEnd - t - 8; d++) {
+            int cur = 0, best = 0;
+            for (int y = t; y + d < bandEnd; y++) {
+                if (!infoA[y + d] && !infoB[y]) continue;
+                if (SigRowsEqual(rowA(y + d), rowB(y), nb, tol)) {
+                    cur += 1;
+                    if (cur > best) best = cur;
+                } else {
+                    cur -= 3;
+                    if (cur < 0) cur = 0;
+                }
+            }
+            bool better = false;
+            if (bestShift < 0) better = true;
+            else if (expected > 0) {
+                // Prefer the shift near the expected step when its run is
+                // comparably long (guards against repeated-looking content).
+                bool nearD = abs(d - expected) <= max(8, expected / 6);
+                bool nearB = abs(bestShift - expected) <= max(8, expected / 6);
+                if (nearD && !nearB) better = best * 10 >= bestScore * 6;
+                else if (!nearD && nearB) better = best * 6 > bestScore * 10;
+                else better = best > bestScore + 2 ||
+                    (best >= bestScore - 2 && abs(d - expected) < abs(bestShift - expected));
+            } else {
+                better = best > bestScore + 2;
+            }
+            if (better) {
+                bestScore = best;
+                bestShift = d;
+            }
+        }
+
+        if (bestShift >= 0 && bestScore >= 8) {
+            res.ok = true;
+            res.shift = bestShift;
+            res.topStatic = t;
+            res.bottomStatic = bs;
+            return res;
+        }
+    }
+    return res;
+}
+
+static HBITMAP CreateDib32(int w, int h, void** bits) {
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, bits, nullptr, 0);
+}
+
+// frames[i] moved up by shifts[i] relative to frames[i-1]; `footer` fixed rows at the bottom.
+static HBITMAP StitchScrollFrames(const std::vector<HBITMAP>& frames,
+                                  const std::vector<int>& shifts, int footer) {
+    if (frames.empty()) return nullptr;
+    BITMAP bm0;
+    GetObject(frames[0], sizeof(bm0), &bm0);
+    int width = bm0.bmWidth, frameH = bm0.bmHeight;
+    footer = max(0, min(footer, frameH / 2));
+    int maxShift = 0;
+    for (size_t i = 1; i < frames.size(); i++) maxShift = max(maxShift, shifts[i]);
+    footer = min(footer, max(0, frameH - maxShift));
+    int b = frameH - footer;
+
+    long long totalH = frameH;
+    for (size_t i = 1; i < frames.size(); i++) totalH += shifts[i];
+    if (totalH <= 0 || totalH > 0x7FFFFFFF / 4 / max(1, width)) return nullptr;
+
+    void* bits = nullptr;
+    HBITMAP hResult = CreateDib32(width, (int)totalH, &bits);
+    if (!hResult) return nullptr;
+
+    HDC hdcDst = CreateCompatibleDC(nullptr);
+    HDC hdcSrc = CreateCompatibleDC(nullptr);
+    HGDIOBJ oldDst = SelectObject(hdcDst, hResult);
+    HGDIOBJ oldSrc = SelectObject(hdcSrc, frames[0]);
+
+    // First frame: everything above the fixed footer
+    BitBlt(hdcDst, 0, 0, width, b, hdcSrc, 0, 0, SRCCOPY);
+    int dstY = b;
+    // Each next frame contributes only the rows that newly scrolled into view
+    for (size_t i = 1; i < frames.size(); i++) {
+        int d = shifts[i];
+        if (d <= 0) continue;
+        int srcY = max(0, b - d);
+        int copyH = b - srcY;
+        SelectObject(hdcSrc, frames[i]);
+        BitBlt(hdcDst, 0, dstY, width, copyH, hdcSrc, 0, srcY, SRCCOPY);
+        dstY += d;
+    }
+    // Fixed footer from the last frame
+    if (footer > 0) {
+        SelectObject(hdcSrc, frames.back());
+        BitBlt(hdcDst, 0, dstY, width, footer, hdcSrc, 0, b, SRCCOPY);
+    }
+
+    SelectObject(hdcSrc, oldSrc);
+    SelectObject(hdcDst, oldDst);
+    DeleteDC(hdcDst);
+    DeleteDC(hdcSrc);
+    return hResult;
+}
+
+// ESC handling for scrolling capture. A low-level keyboard hook on its own
+// thread (with its own message loop) sees ESC no matter which window has
+// focus and no matter how long the capture thread is busy.
+static volatile LONG g_scrollCancel = 0;
+static HHOOK g_scrollKbHook = nullptr;
+
+static LRESULT CALLBACK ScrollKbProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lParam;
+        if (k->vkCode == VK_ESCAPE) {
+            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+                InterlockedExchange(&g_scrollCancel, 1);
+            return 1; // don't pass ESC to the window being captured
+        }
+    }
+    return CallNextHookEx(g_scrollKbHook, nCode, wParam, lParam);
+}
+
+static DWORD WINAPI ScrollKbThread(LPVOID param) {
+    MSG msg;
+    PeekMessage(&msg, nullptr, 0, 0, PM_NOREMOVE); // create the message queue
+    g_scrollKbHook = SetWindowsHookEx(WH_KEYBOARD_LL, ScrollKbProc, GetModuleHandle(nullptr), 0);
+    SetEvent((HANDLE)param);
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    if (g_scrollKbHook) UnhookWindowsHookEx(g_scrollKbHook);
+    g_scrollKbHook = nullptr;
+    return 0;
+}
+
+struct EscWatcher {
+    HANDLE thread = nullptr;
+    DWORD tid = 0;
+    EscWatcher() {
+        InterlockedExchange(&g_scrollCancel, 0);
+        HANDLE ready = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        thread = CreateThread(nullptr, 0, ScrollKbThread, ready, 0, &tid);
+        if (thread && ready) WaitForSingleObject(ready, 2000);
+        if (ready) CloseHandle(ready);
+    }
+    ~EscWatcher() {
+        if (thread) {
+            PostThreadMessage(tid, WM_QUIT, 0, 0);
+            WaitForSingleObject(thread, 2000);
+            CloseHandle(thread);
+        }
+    }
+};
+
+static bool ScrollCancelled() { return g_scrollCancel != 0; }
+
+static void CancelableSleep(int ms) {
+    DWORD start = GetTickCount();
+    while (!ScrollCancelled() && (int)(GetTickCount() - start) < ms)
+        Sleep(min(10, max(1, ms)));
+}
+
+static HHOOK g_scrollPickHook = nullptr;
+static HWND g_scrollPickResult = nullptr;
+static bool g_scrollPickSwallowUp = false;
+
+static LRESULT CALLBACK ScrollPickProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0) {
+        if (wParam == WM_LBUTTONDOWN && !g_scrollPickSwallowUp) {
+            MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
+            HWND hit = WindowFromPoint(ms->pt);
+            HWND root = hit ? GetAncestor(hit, GA_ROOT) : nullptr;
+            if (hit && root != g.hwndMain && !IsChild(g.hwndMain, hit)) {
+                // Eat the click so it does not press a link/button in the target
+                g_scrollPickResult = hit;
+                g_scrollPickSwallowUp = true;
+                return 1;
+            }
+        } else if (wParam == WM_LBUTTONUP && g_scrollPickSwallowUp) {
+            g_scrollPickSwallowUp = false;
+            HHOOK hk = g_scrollPickHook;
+            g_scrollPickHook = nullptr;
+            UnhookWindowsHookEx(hk);
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_scrollPickHook, nCode, wParam, lParam);
+}
+
+static HWND PickWindowForScrollCapture() {
+    g_scrollPickResult = nullptr;
+    g_scrollPickSwallowUp = false;
+    g_scrollPickHook = SetWindowsHookEx(WH_MOUSE_LL, ScrollPickProc,
+        GetModuleHandle(nullptr), 0);
+    if (!g_scrollPickHook) return nullptr;
+    MSG msg;
+    while (g_scrollPickHook) {
+        if (ScrollCancelled()) {
+            UnhookWindowsHookEx(g_scrollPickHook);
+            g_scrollPickHook = nullptr;
+            g_scrollPickResult = nullptr;
+            break;
+        }
+        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        } else {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+        }
+    }
+    g_scrollPickSwallowUp = false;
+    return g_scrollPickResult;
+}
+
+static bool IsWindowOccluded(HWND frame) {
+    RECT cr;
+    GetClientRect(frame, &cr);
+    POINT cTL = { 0, 0 };
+    ClientToScreen(frame, &cTL);
+    int cw = cr.right, ch = cr.bottom;
+    if (cw < 20 || ch < 20) return true;
+    const int nx = 7, ny = 7;
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            POINT pt = {
+                cTL.x + (int)((long long)(i + 1) * cw / (nx + 1)),
+                cTL.y + (int)((long long)(j + 1) * ch / (ny + 1))
+            };
+            HWND h = WindowFromPoint(pt);
+            if (!h) continue;
+            HWND root = GetAncestor(h, GA_ROOT);
+            if (root != frame) return true;
+        }
+    }
+    return false;
+}
+
+static bool SameFrameBits(HBITMAP a, const void* ab, HBITMAP b, const void* bb) {
+    if (!a || !b || !ab || !bb) return false;
+    BITMAP ma, mb;
+    GetObject(a, sizeof(ma), &ma);
+    GetObject(b, sizeof(mb), &mb);
+    if (ma.bmWidth != mb.bmWidth || ma.bmHeight != mb.bmHeight) return false;
+    return memcmp(ab, bb, (size_t)ma.bmWidth * ma.bmHeight * 4) == 0;
+}
+
+// Captures the client area after a scroll request:
+//  1. waits for the window to start changing (input is handled asynchronously),
+//  2. then waits until it has stopped changing (smooth-scroll animation done).
+// With prevBmp == nullptr only step 2 is done.
+static HBITMAP CaptureSettledClient(HWND frame, HBITMAP prevBmp, const void* prevBits, void** outBits) {
+    CancelableSleep(120);
+    void* curBits = nullptr;
+    HBITMAP cur = CaptureWindowClient(frame, &curBits, true);
+
+    if (prevBmp) {
+        DWORD t0 = GetTickCount();
+        while (cur && !ScrollCancelled() && (int)(GetTickCount() - t0) < 800 &&
+               SameFrameBits(prevBmp, prevBits, cur, curBits)) {
+            CancelableSleep(40);
+            void* nb = nullptr;
+            HBITMAP n = CaptureWindowClient(frame, &nb, true);
+            if (!n) break;
+            DeleteObject(cur);
+            cur = n;
+            curBits = nb;
+        }
+    }
+
+    int sameCount = 0;
+    DWORD t0 = GetTickCount();
+    while (cur && !ScrollCancelled() && (int)(GetTickCount() - t0) < 2000) {
+        CancelableSleep(50);
+        void* nb = nullptr;
+        HBITMAP n = CaptureWindowClient(frame, &nb, true);
+        if (!n) break;
+        bool same = SameFrameBits(cur, curBits, n, nb);
+        DeleteObject(cur);
+        cur = n;
+        curBits = nb;
+        if (same) {
+            if (++sameCount >= 2) break;
+        } else {
+            sameCount = 0;
+        }
+    }
+    if (outBits) *outBits = curBits;
+    return cur;
+}
+
+// Set environment variable SCROLLCAP_DEBUG=<folder> to dump raw frames and a log.
+static void ScrollDebugDump(const void* a, const void* b, int w, int h, int cycle, int ticks,
+                            int method, const ShiftResult& sr) {
+    wchar_t dir[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"SCROLLCAP_DEBUG", dir, MAX_PATH)) return;
+    CreateDirectoryW(dir, nullptr);
+    wchar_t path[MAX_PATH];
+    const void* bufs[2] = { a, b };
+    for (int i = 0; i < 2; i++) {
+        swprintf(path, MAX_PATH, L"%s\\c%03d_%c.raw", dir, cycle, i ? 'b' : 'a');
+        HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        DWORD wr;
+        int hdr[2] = { w, h };
+        WriteFile(f, hdr, sizeof(hdr), &wr, nullptr);
+        WriteFile(f, bufs[i], (DWORD)((size_t)w * h * 4), &wr, nullptr);
+        CloseHandle(f);
+    }
+    swprintf(path, MAX_PATH, L"%s\\log.txt", dir);
+    HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        char line[200];
+        int n = sprintf(line, "cycle %d method %d ticks %d -> ok %d shift %d top %d bottom %d\r\n",
+                        cycle, method, ticks, sr.ok, sr.shift, sr.topStatic, sr.bottomStatic);
+        DWORD wr;
+        WriteFile(f, line, n, &wr, nullptr);
+        CloseHandle(f);
+    }
+}
+
+static void ScrollCaptureWindow(HWND hwndMain) {
+    FlattenToBitmap();
+    MessageBox(hwndMain,
+        L"Click on the window you want to capture.\n"
+        L"The window must be visible on screen.\n\n"
+        L"Press ESC to cancel, or to stop scrolling early.",
+        L"Scrolling Capture", MB_OK | MB_ICONINFORMATION);
+
+    EscWatcher escWatcher;
+
+    ShowWindow(hwndMain, SW_HIDE);
+    RedrawWindow(nullptr, nullptr, nullptr,
+        RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_INVALIDATE | RDW_ERASE);
+    DwmFlush();
+    Sleep(300);
+
+    HWND target = PickWindowForScrollCapture();
+    if (!target || !IsWindow(target) || ScrollCancelled()) {
+        ShowWindow(hwndMain, SW_SHOW);
+        return;
+    }
+
+    HWND frame = GetAncestor(target, GA_ROOT);
+    if (!frame || !IsWindow(frame)) frame = target;
+    SetForegroundWindow(frame);
+    Sleep(150);
+
+    if (IsWindowOccluded(frame)) {
+        ShowWindow(hwndMain, SW_SHOW);
+        MessageBox(hwndMain,
+            L"The chosen window is covered by other windows.\n"
+            L"Bring it fully to the front, then start scrolling capture again.",
+            L"Scrolling Capture", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    RECT cr;
+    GetClientRect(frame, &cr);
+    int winH = cr.bottom - cr.top;
+    int winW = cr.right - cr.left;
+    if (winH <= 0 || winW <= 0) {
+        ShowWindow(hwndMain, SW_SHOW);
+        return;
+    }
+
+    // Point inside the area the user clicked; used for wheel input
+    POINT clickPt;
+    GetCursorPos(&clickPt);
+    POINT wpt = clickPt;
+    {
+        RECT wr;
+        GetWindowRect(frame, &wr);
+        if (!PtInRect(&wr, wpt)) {
+            wpt = { cr.right / 2, (int)(cr.bottom * 0.55) };
+            ClientToScreen(frame, &wpt);
+        }
+    }
+    HWND wheelTarget = WindowFromPoint(wpt);
+    if (!wheelTarget || GetAncestor(wheelTarget, GA_ROOT) != frame) wheelTarget = target;
+
+    // Window that owns a native scrollbar, if any
+    HWND nativeTarget = nullptr;
+    for (HWND cand : { target, FindScrollableChild(frame), frame }) {
+        if (!cand) continue;
+        SCROLLINFO si = { sizeof(si), SIF_POS | SIF_RANGE | SIF_PAGE };
+        if ((GetWindowLong(cand, GWL_STYLE) & WS_VSCROLL) &&
+            GetScrollInfo(cand, SB_VERT, &si) && si.nMax > si.nMin &&
+            (int)si.nPage <= si.nMax - si.nMin) {
+            nativeTarget = cand;
+            break;
+        }
+    }
+
+    // Ignore the scrollbar column when matching frames (its thumb moves)
+    int dpi = GetWindowDpiSafe(frame);
+    int sbw = min(winW / 8, MulDiv(24, dpi, 96));
+    int matchX0 = min(4, winW / 4);
+    int matchX1 = max(matchX0 + 1, winW - sbw);
+
+    for (auto& f : g.scrollCapFrames)
+        if (f) DeleteObject(f);
+    g.scrollCapFrames.clear();
+    g.scrollCapFrameY.clear();
+    g.scrollCapFrameScroll.clear();
+
+    void* firstBits = nullptr;
+    HBITMAP first = CaptureSettledClient(frame, nullptr, nullptr, &firstBits);
+    if (!first || !firstBits || ScrollCancelled()) {
+        if (first) DeleteObject(first);
+        ShowWindow(hwndMain, SW_SHOW);
+        if (!ScrollCancelled())
+            MessageBox(hwndMain, L"Failed to capture the window.", L"Scrolling Capture", MB_OK | MB_ICONERROR);
+        return;
+    }
+    BITMAP bmFirst;
+    GetObject(first, sizeof(bmFirst), &bmFirst);
+    const int frameW = bmFirst.bmWidth, frameH = bmFirst.bmHeight;
+
+    std::vector<int> pairTops(1, 0);
+    g.scrollCapFrames.push_back(first);
+    g.scrollCapFrameScroll.push_back(0);   // shift relative to previous frame
+    g.scrollCapFrameY.push_back(0);        // fixed footer rows for that pair
+    HBITMAP prevBmp = first;
+    void* prevBits = firstBits;
+
+    enum Method { M_NATIVE = 0, M_INPUT, M_MSG, M_COUNT };
+    Method order[M_COUNT];
+    int nMethods = 0;
+    if (nativeTarget) order[nMethods++] = M_NATIVE;
+    order[nMethods++] = M_INPUT;
+    order[nMethods++] = M_MSG;
+    int methodIdx = 0;
+
+    POINT savedCursor = clickPt;
+    bool cursorMoved = false;
+
+    auto doScroll = [&](Method m, int ticks, bool down) {
+        if (m == M_NATIVE) {
+            for (int i = 0; i < ticks; i++)
+                SendMessage(nativeTarget, WM_VSCROLL, down ? SB_LINEDOWN : SB_LINEUP, 0);
+            SendMessage(nativeTarget, WM_VSCROLL, SB_ENDSCROLL, 0);
+        } else if (m == M_INPUT) {
+            cursorMoved = true;
+            SetCursorPos(wpt.x, wpt.y);
+            for (int i = 0; i < ticks; i++) {
+                INPUT input = {};
+                input.type = INPUT_MOUSE;
+                input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+                input.mi.mouseData = (DWORD)(down ? -(int)WHEEL_DELTA : (int)WHEEL_DELTA);
+                SendInput(1, &input, sizeof(INPUT));
+                Sleep(15);
+            }
+        } else {
+            for (int i = 0; i < ticks; i++) {
+                WPARAM wp = MAKEWPARAM(0, (WORD)(short)(down ? -(int)WHEEL_DELTA : (int)WHEEL_DELTA));
+                LPARAM lp = MAKELPARAM((short)wpt.x, (short)wpt.y);
+                PostMessage(wheelTarget, WM_MOUSEWHEEL, wp, lp);
+                Sleep(15);
+            }
+        }
+    };
+
+    // Start with the smallest step, measure how far one step moves, then grow
+    // the step so consecutive frames still overlap by about half a screen.
+    auto initialTicks = [&](Method m) { return m == M_NATIVE ? 3 : 1; };
+    int ticks = initialTicks(order[0]);
+    double pxPerTick = 0;
+    int stall = 0, dead = 0, fails = 0, backtracks = 0;
+    long long totalH = frameH;
+    const long long maxTotalH = 60000;
+    DWORD captureStart = GetTickCount();
+
+    for (int cycle = 0; cycle < 1000; cycle++) {
+        if (ScrollCancelled()) break;
+        if (GetTickCount() - captureStart > 5 * 60 * 1000) break;
+        if (totalH >= maxTotalH) break;
+
+        Method m = order[methodIdx];
+        doScroll(m, ticks, true);
+
+        void* nb = nullptr;
+        HBITMAP next = CaptureSettledClient(frame, prevBmp, prevBits, &nb);
+        if (!next || !nb) { if (next) DeleteObject(next); break; }
+        BITMAP bmNext;
+        GetObject(next, sizeof(bmNext), &bmNext);
+        if (bmNext.bmWidth != frameW || bmNext.bmHeight != frameH) {
+            DeleteObject(next);   // window was resized; keep what we have
+            break;
+        }
+
+        int expected = pxPerTick > 0 ? (int)(pxPerTick * ticks + 0.5) : 0;
+        ShiftResult sr = FindScrollShift((const BYTE*)prevBits, (const BYTE*)nb, frameW, frameH,
+                                         matchX0, matchX1, expected);
+        ScrollDebugDump(prevBits, nb, frameW, frameH, cycle, ticks, (int)m, sr);
+
+        if (sr.ok && sr.shift > 0) {
+            stall = 0; dead = 0; fails = 0;
+            g.scrollCapFrames.push_back(next);
+            g.scrollCapFrameScroll.push_back(sr.shift);
+            g.scrollCapFrameY.push_back(sr.bottomStatic);
+            pairTops.push_back(sr.topStatic);
+            prevBmp = next;
+            prevBits = nb;
+            totalH += sr.shift;
+
+            int regionH = max(48, frameH - sr.topStatic - sr.bottomStatic);
+            double ppt = (double)sr.shift / ticks;
+            if (ppt > pxPerTick) pxPerTick = ppt;
+            int maxTicks = (m == M_NATIVE) ? 200 : 10;
+            ticks = max(1, min(maxTicks, (int)(regionH * 0.5 / pxPerTick)));
+            continue;
+        }
+
+        if (sr.ok) {
+            DeleteObject(next);
+            // Nothing scrolled
+            if (g.scrollCapFrames.size() > 1) {
+                if (++stall >= 2) break;    // reached the end
+            } else if (++dead >= 2) {
+                dead = 0;                   // this method doesn't move the window
+                if (++methodIdx >= nMethods) break;
+                ticks = initialTicks(order[methodIdx]);
+            }
+            continue;
+        }
+
+        // Content changed but no overlap with the previous frame was found.
+        DeleteObject(next);
+        if (++fails >= 3 || ticks <= 1 || ++backtracks > 4) break;
+        // Scrolled too far: go back the same distance and retry with a smaller step.
+        doScroll(m, ticks, false);
+        HBITMAP settle = CaptureSettledClient(frame, nullptr, nullptr, nullptr);
+        if (settle) DeleteObject(settle);
+        ticks = max(1, ticks / 2);
+    }
+
+    if (cursorMoved)
+        SetCursorPos(savedCursor.x, savedCursor.y);
+
+    if (g.scrollCapFrames.size() <= 1 && !ScrollCancelled()) {
+        MessageBox(hwndMain,
+            L"Could not scroll the selected window.\n"
+            L"It may have no scrollable content, or it is not accepting scroll input.",
+            L"Scrolling Capture", MB_OK | MB_ICONWARNING);
+    }
+
+    // Fixed footer height. Each appended strip (the bottom `shift` rows above the
+    // footer) must stay below that frame's fixed header, which limits the footer.
+    int footer = 0;
+    for (size_t i = 1; i < g.scrollCapFrameY.size(); i++)
+        footer = max(footer, g.scrollCapFrameY[i]);
+    for (size_t i = 1; i < g.scrollCapFrameScroll.size() && i < pairTops.size(); i++)
+        footer = min(footer, frameH - g.scrollCapFrameScroll[i] - pairTops[i]);
+    footer = max(0, footer);
+
+    HBITMAP hStitched = StitchScrollFrames(g.scrollCapFrames, g.scrollCapFrameScroll, footer);
+
+    for (auto& f : g.scrollCapFrames)
+        if (f) DeleteObject(f);
+    g.scrollCapFrames.clear();
+    g.scrollCapFrameY.clear();
+    g.scrollCapFrameScroll.clear();
+
+    ShowWindow(hwndMain, SW_SHOW);
+    SetForegroundWindow(hwndMain);
+
+    if (hStitched) {
+        BITMAP bm;
+        GetObject(hStitched, sizeof(bm), &bm);
+        SetImage(hStitched, bm.bmWidth, bm.bmHeight);
+        FitToWindow();
+        InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+        UpdateStatus();
+    }
+}
+
 static void UpdateTabControl();
 static void RebuildToolbar();
 
@@ -450,6 +1461,51 @@ static void SetImage(HBITMAP hBmp, int w, int h) {
     TabCtrl_SetCurSel(g.hwndTab, idx);
 }
 
+static void UpdateCanvasScrollBars() {
+    if (!g.hwndCanvas) return;
+    TabData* t = ActiveTab();
+    RECT rc;
+    GetClientRect(g.hwndCanvas, &rc);
+    int cw = rc.right, ch = rc.bottom;
+
+    if (!t || !t->hasImage || cw < 1 || ch < 1) {
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        si.nMin = 0; si.nMax = 0; si.nPage = 0; si.nPos = 0;
+        SetScrollInfo(g.hwndCanvas, SB_HORZ, &si, TRUE);
+        SetScrollInfo(g.hwndCanvas, SB_VERT, &si, TRUE);
+        return;
+    }
+
+    int dw = (int)(t->imgW * t->zoom);
+    int dh = (int)(t->imgH * t->zoom);
+
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+
+    if (dw > cw) {
+        int hMax = dw - cw;
+        t->offsetX = max(-(double)hMax, min(0.0, t->offsetX));
+        si.nMin = 0; si.nMax = dw; si.nPage = cw; si.nPos = (int)(-t->offsetX);
+    } else {
+        t->offsetX = (cw - dw) / 2.0;
+        si.nMin = 0; si.nMax = 0; si.nPage = 0; si.nPos = 0;
+    }
+    SetScrollInfo(g.hwndCanvas, SB_HORZ, &si, TRUE);
+
+    if (dh > ch) {
+        int vMax = dh - ch;
+        t->offsetY = max(-(double)vMax, min(0.0, t->offsetY));
+        si.nMin = 0; si.nMax = dh; si.nPage = ch; si.nPos = (int)(-t->offsetY);
+    } else {
+        t->offsetY = (ch - dh) / 2.0;
+        si.nMin = 0; si.nMax = 0; si.nPage = 0; si.nPos = 0;
+    }
+    SetScrollInfo(g.hwndCanvas, SB_VERT, &si, TRUE);
+}
+
 static void FitToWindow() {
     TabData* t = ActiveTab();
     if (!t || !t->hasImage || !g.hwndCanvas) return;
@@ -461,6 +1517,7 @@ static void FitToWindow() {
     t->zoom = min(sx, sy) * 0.92;
     t->offsetX = (rc.right - t->imgW * t->zoom) / 2.0;
     t->offsetY = (rc.bottom - t->imgH * t->zoom) / 2.0;
+    UpdateCanvasScrollBars();
 }
 
 static POINT CanvasToImage(POINT pt) {
@@ -571,76 +1628,7 @@ static void FlattenToBitmap() {
         case Tool::Callout: {
             DeleteObject(hPen);
             hPen = nullptr;
-            int fs = max(8, s.fontSize);
-            HFONT hf = CreateFont(-fs, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
-                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
-            HFONT hof = (HFONT)SelectObject(hdc, hf);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, s.color);
-            int pad = 6;
-            int maxBubbleW = 300;
-            RECT rcCalc = { 0, 0, maxBubbleW, 10000 };
-            if (!s.text.empty())
-                DrawText(hdc, s.text.c_str(), (int)s.text.size(), &rcCalc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
-            int bw = rcCalc.right + pad * 2;
-            int bh = rcCalc.bottom + pad * 2;
-            int bx = s.endPt.x - bw / 2;
-            int by = s.endPt.y - bh / 2;
-            HBRUSH bgBr = CreateSolidBrush(RGB(255, 255, 255));
-            HPEN borderPen = CreatePen(PS_SOLID, max(1, s.penWidth), s.color);
-            HBRUSH ob2 = (HBRUSH)SelectObject(hdc, bgBr);
-            HPEN op2 = (HPEN)SelectObject(hdc, borderPen);
-            RoundRect(hdc, bx, by, bx + bw, by + bh, 8, 8);
-            SelectObject(hdc, ob2);
-            SelectObject(hdc, op2);
-            DeleteObject(bgBr);
-            DeleteObject(borderPen);
-            RECT rcTxt = { bx + pad, by + pad, bx + bw - pad, by + bh - pad };
-            if (!s.text.empty())
-                DrawText(hdc, s.text.c_str(), (int)s.text.size(), &rcTxt, DT_LEFT | DT_TOP | DT_WORDBREAK);
-            double acx = (double)s.endPt.x, acy = (double)s.endPt.y;
-            double atx = (double)s.startPt.x, aty = (double)s.startPt.y;
-            double ang = atan2(aty - acy, atx - acx);
-            double adx = cos(ang), ady = sin(ang);
-            double ix = acx, iy = acy;
-            if (adx > 0) ix = bx + bw; else if (adx < 0) ix = bx;
-            if (ady > 0) iy = by + bh; else if (ady < 0) iy = by;
-            if (adx != 0) { double frac = (ix - acx) / adx; iy = acy + frac * ady; }
-            if (iy < by || iy > by + bh) {
-                if (ady > 0) iy = by + bh; else iy = by;
-                double frac = (iy - acy) / ady;
-                ix = acx + frac * adx;
-            }
-            HPEN arrPen = CreatePen(PS_SOLID, max(1, s.penWidth), s.color);
-            HPEN op3 = (HPEN)SelectObject(hdc, arrPen);
-            HBRUSH arrBr = CreateSolidBrush(s.color);
-            HBRUSH ob3 = (HBRUSH)SelectObject(hdc, arrBr);
-            POINT arrowTail = { (int)ix, (int)iy };
-            POINT arrowTip = { (int)atx, (int)aty };
-            double ddx = arrowTip.x - arrowTail.x, ddy = arrowTip.y - arrowTail.y;
-            double len = sqrt(ddx * ddx + ddy * ddy);
-            if (len > 1) {
-                double nx = ddx / len, ny = ddy / len;
-                double hl = max(8.0, 12.0);
-                double hw = hl * 0.5;
-                POINT pts[3] = {
-                    arrowTip,
-                    { (int)(arrowTip.x - nx * hl + ny * hw), (int)(arrowTip.y - ny * hl - nx * hw) },
-                    { (int)(arrowTip.x - nx * hl - ny * hw), (int)(arrowTip.y - ny * hl + nx * hw) }
-                };
-                Polygon(hdc, pts, 3);
-                double shaftLen = len - hl * 0.3;
-                if (shaftLen > 0) {
-                    MoveToEx(hdc, (int)arrowTail.x, (int)arrowTail.y, nullptr);
-                    LineTo(hdc, (int)(arrowTail.x + nx * shaftLen), (int)(arrowTail.y + ny * shaftLen));
-                }
-            }
-            SelectObject(hdc, op3);
-            SelectObject(hdc, ob3);
-            DeleteObject(arrPen);
-            DeleteObject(arrBr);
-            SelectObject(hdc, hof);
-            DeleteObject(hf);
+            DrawCallout(hdc, s, 1.0, 0.0, 0.0);
             break;
         }
         default: break;
@@ -896,77 +1884,241 @@ static void ShowAboutDlg(HWND parent) {
         });
 }
 
-static INT_PTR CALLBACK FontDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_INITDIALOG) {
-        TabData* t = (TabData*)lp;
-        SetWindowLongPtr(hDlg, DWLP_USER, (LONG_PTR)lp);
-        SetDlgItemText(hDlg, 300, t->strokes[t->selIdx].text.c_str());
+// Index of a text/callout that was just placed and is waiting for its first
+// edit in the dialog (-1 if none). Cancel removes it.
+static int g_pendingNewAnnot = -1;
+
+static void RebuildToolbar();
+
+// Refreshes toolbar highlight, undo/redo state and the status bar after
+// changes made from the canvas or a dialog.
+static void RefreshChrome() {
+    RebuildToolbar();
+    UpdateStatus();
+    if (g.hwndMain) InvalidateRect(g.hwndMain, nullptr, FALSE);
+    if (g.hwndCanvas) InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+}
+
+// The text/callout edit dialog is bound to one specific shape (tab id + index)
+// for its whole lifetime. It is modal, so clicks on the canvas can't change
+// which shape gets edited, and it previews every change live. Cancel restores
+// the original (or removes a shape that was just placed).
+struct AnnotEdit {
+    int tabId = -1;
+    int idx = -1;
+    Stroke original;
+    bool isNew = false;
+    bool initializing = false;
+};
+static AnnotEdit g_annotEdit;
+
+static TabData* FindTabById(int id) {
+    for (auto& t : g.tabs)
+        if (t.id == id) return &t;
+    return nullptr;
+}
+
+static Stroke* AnnotEditTarget() {
+    TabData* t = FindTabById(g_annotEdit.tabId);
+    if (!t || g_annotEdit.idx < 0 || g_annotEdit.idx >= (int)t->strokes.size()) return nullptr;
+    Stroke& s = t->strokes[g_annotEdit.idx];
+    if (s.tool != Tool::Text && s.tool != Tool::Callout) return nullptr;
+    return &s;
+}
+
+static std::wstring GetDlgItemString(HWND hDlg, int id) {
+    HWND h = GetDlgItem(hDlg, id);
+    int len = GetWindowTextLength(h);
+    std::wstring s(len + 1, L'\0');
+    GetWindowText(h, &s[0], len + 1);
+    s.resize(len);
+    return s;
+}
+
+// Copies the dialog's current values into the shape being edited.
+static void ApplyAnnotDialog(HWND hDlg) {
+    Stroke* s = AnnotEditTarget();
+    if (!s) return;
+    s->text = GetDlgItemString(hDlg, 300);
+    // The font box is editable: read what is shown, not the list selection
+    std::wstring fn = GetDlgItemString(hDlg, 301);
+    if (!fn.empty()) s->fontName = fn;
+    int sz = _wtoi(GetDlgItemString(hDlg, 302).c_str());
+    if (sz >= 6) s->fontSize = min(200, sz);
+}
+
+static void RemoveAnnotEditTarget() {
+    TabData* t = FindTabById(g_annotEdit.tabId);
+    if (!t || g_annotEdit.idx < 0 || g_annotEdit.idx >= (int)t->strokes.size()) return;
+    t->strokes.erase(t->strokes.begin() + g_annotEdit.idx);
+    if (t->selIdx == g_annotEdit.idx) t->selIdx = -1;
+    else if (t->selIdx > g_annotEdit.idx) t->selIdx--;
+}
+
+static void RestoreAnnotOriginal() {
+    if (Stroke* s = AnnotEditTarget()) *s = g_annotEdit.original;
+}
+
+static void RedrawCanvasNow() {
+    if (!g.hwndCanvas) return;
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+    UpdateWindow(g.hwndCanvas);
+}
+
+// Puts the dialog beside the shape (right of it if there is room, else left),
+// kept inside the monitor's work area.
+static void PositionAnnotDialog(HWND hDlg) {
+    Stroke* s = AnnotEditTarget();
+    TabData* t = FindTabById(g_annotEdit.tabId);
+    if (!s || !t || !g.hwndCanvas) return;
+    POINT tl, br;
+    GetBBox(*s, tl, br);
+    if (s->tool == Tool::Callout) {
+        // The bubble grows around its centre as text is typed; leave room
+        // for its widest possible size so the dialog doesn't cover it.
+        int half = CALLOUT_MAX_TEXT_W / 2 + max(6, s->fontSize / 3) + 4;
+        tl.x = min(tl.x, s->endPt.x - half);
+        br.x = max(br.x, s->endPt.x + half);
+    }
+    POINT a = { (LONG)(tl.x * t->zoom + t->offsetX), (LONG)(tl.y * t->zoom + t->offsetY) };
+    POINT b = { (LONG)(br.x * t->zoom + t->offsetX), (LONG)(br.y * t->zoom + t->offsetY) };
+    ClientToScreen(g.hwndCanvas, &a);
+    ClientToScreen(g.hwndCanvas, &b);
+
+    RECT dr;
+    GetWindowRect(hDlg, &dr);
+    int dw = dr.right - dr.left, dh = dr.bottom - dr.top;
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(MonitorFromPoint(a, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT wa = mi.rcWork;
+
+    int x = b.x + 16;
+    if (x + dw > wa.right) x = a.x - 16 - dw;
+    if (x < wa.left) x = wa.right - dw;   // no room either side: keep on screen
+    int y = a.y;
+    x = max((int)wa.left, min(x, (int)wa.right - dw));
+    y = max((int)wa.top, min(y, (int)wa.bottom - dh));
+    SetWindowPos(hDlg, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static INT_PTR CALLBACK FontDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        Stroke* s = AnnotEditTarget();
+        if (!s) { EndDialog(hDlg, IDCANCEL); return TRUE; }
+        g_annotEdit.initializing = true;
+        SetWindowText(hDlg, s->tool == Tool::Callout ? L"Edit Callout" : L"Edit Text");
+        {
+            // The edit box only shows line breaks written as \r\n
+            std::wstring shown;
+            for (size_t i = 0; i < s->text.size(); i++) {
+                wchar_t ch = s->text[i];
+                if (ch == L'\n' && (i == 0 || s->text[i - 1] != L'\r')) shown += L'\r';
+                shown += ch;
+            }
+            SetDlgItemText(hDlg, 300, shown.c_str());
+        }
         HWND hCombo = GetDlgItem(hDlg, 301);
         HDC hdc = GetDC(nullptr);
         EnumFontFamilies(hdc, nullptr, [](const LOGFONT* lplf, const TEXTMETRIC*, DWORD, LPARAM lParam) -> int {
-            SendMessage((HWND)lParam, CB_ADDSTRING, 0, (LPARAM)lplf->lfFaceName);
+            HWND hc = (HWND)lParam;
+            if (lplf->lfFaceName[0] != L'@' &&
+                SendMessage(hc, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)lplf->lfFaceName) == CB_ERR)
+                SendMessage(hc, CB_ADDSTRING, 0, (LPARAM)lplf->lfFaceName);
             return 1;
         }, (LPARAM)hCombo);
         ReleaseDC(nullptr, hdc);
-        int idx = (int)SendMessage(hCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)t->strokes[t->selIdx].fontName.c_str());
-        if (idx == CB_ERR) idx = 0;
-        SendMessage(hCombo, CB_SETCURSEL, idx, 0);
-        wchar_t buf[16];
-        swprintf_s(buf, L"%d", t->strokes[t->selIdx].fontSize);
-        SetDlgItemText(hDlg, 302, buf);
-        return TRUE;
+        int idx = (int)SendMessage(hCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)s->fontName.c_str());
+        if (idx != CB_ERR) SendMessage(hCombo, CB_SETCURSEL, idx, 0);
+        else SetWindowText(hCombo, s->fontName.c_str());
+        SetDlgItemInt(hDlg, 302, s->fontSize, FALSE);
+        PositionAnnotDialog(hDlg);
+        g_annotEdit.initializing = false;
+
+        // Focus the text with everything selected so typing replaces it
+        HWND hEdit = GetDlgItem(hDlg, 300);
+        SetFocus(hEdit);
+        SendMessage(hEdit, EM_SETSEL, 0, -1);
+        return FALSE;
     }
-    if (msg == WM_COMMAND && LOWORD(wp) == IDOK) {
-        TabData* t = (TabData*)GetWindowLongPtr(hDlg, DWLP_USER);
-        if (t && t->selIdx >= 0 && t->selIdx < (int)t->strokes.size()) {
-            wchar_t txt[256];
-            GetDlgItemText(hDlg, 300, txt, 256);
-            HWND hCombo = GetDlgItem(hDlg, 301);
-            int idx = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
-            wchar_t fn[LF_FACESIZE];
-            SendMessage(hCombo, CB_GETLBTEXT, idx, (LPARAM)fn);
-            wchar_t bf[16];
-            GetDlgItemText(hDlg, 302, bf, 16);
-            int sz = max(6, min(200, _wtoi(bf)));
-            auto& s = t->strokes[t->selIdx];
-            s.text = txt;
-            s.fontName = fn;
-            s.fontSize = sz;
-            g.fontName = fn;
-            g.fontSize = sz;
+    case WM_COMMAND: {
+        int id = LOWORD(wp), code = HIWORD(wp);
+        // Live preview of every change
+        if (!g_annotEdit.initializing &&
+            ((id == 300 && code == EN_CHANGE) || (id == 302 && code == EN_CHANGE) ||
+             (id == 301 && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE)))) {
+            if (id == 301 && code == CBN_SELCHANGE) {
+                // The edit part isn't updated yet during CBN_SELCHANGE
+                HWND hCombo = GetDlgItem(hDlg, 301);
+                int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+                if (sel != CB_ERR) {
+                    int n = (int)SendMessage(hCombo, CB_GETLBTEXTLEN, sel, 0);
+                    std::wstring fn(n + 1, L'\0');
+                    SendMessage(hCombo, CB_GETLBTEXT, sel, (LPARAM)&fn[0]);
+                    fn.resize(n);
+                    SetWindowText(hCombo, fn.c_str());
+                }
+            }
+            ApplyAnnotDialog(hDlg);
+            RedrawCanvasNow();
+            return TRUE;
         }
-        g.hwndFontDlg = nullptr;
-        DestroyWindow(hDlg);
-        InvalidateRect(g.hwndCanvas, nullptr, FALSE);
-        return TRUE;
+        if (id == IDOK) {
+            ApplyAnnotDialog(hDlg);
+            Stroke* s = AnnotEditTarget();
+            bool blank = !s || s->text.find_first_not_of(L" \t\r\n") == std::wstring::npos;
+            if (blank) {
+                // Don't keep an empty shape: drop a new one, restore an existing one
+                if (g_annotEdit.isNew) RemoveAnnotEditTarget();
+                else RestoreAnnotOriginal();
+            } else {
+                g.fontName = s->fontName;   // defaults for the next text/callout
+                g.fontSize = s->fontSize;
+            }
+            EndDialog(hDlg, IDOK);
+            return TRUE;
+        }
+        if (id == IDCANCEL) {
+            if (g_annotEdit.isNew) RemoveAnnotEditTarget();
+            else RestoreAnnotOriginal();
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+        break;
     }
-    if (msg == WM_COMMAND && (LOWORD(wp) == IDCANCEL || LOWORD(wp) == 2)) {
-        g.hwndFontDlg = nullptr;
-        DestroyWindow(hDlg);
-        return TRUE;
-    }
-    if (msg == WM_CLOSE) {
-        g.hwndFontDlg = nullptr;
-        DestroyWindow(hDlg);
+    case WM_CLOSE:
+        SendMessage(hDlg, WM_COMMAND, IDCANCEL, 0);
         return TRUE;
     }
     return FALSE;
 }
 
 static void ShowFontDlg() {
-    if (g.hwndFontDlg) {
-        SetForegroundWindow(g.hwndFontDlg);
-        return;
-    }
+    static bool open = false;
+    if (open) return;
     TabData* t = ActiveTab();
     if (!t || t->selIdx < 0 || t->selIdx >= (int)t->strokes.size() ||
-        (t->strokes[t->selIdx].tool != Tool::Text && t->strokes[t->selIdx].tool != Tool::Callout)) return;
-    g.hwndFontDlg = CreateDialogParam(nullptr, MAKEINTRESOURCE(IDD_FONT), g.hwndMain,
-        FontDlgProc, (LPARAM)t);
-    if (g.hwndFontDlg) {
-        ShowWindow(g.hwndFontDlg, SW_SHOW);
-        UpdateWindow(g.hwndFontDlg);
+        (t->strokes[t->selIdx].tool != Tool::Text && t->strokes[t->selIdx].tool != Tool::Callout)) {
+        g_pendingNewAnnot = -1;
+        return;
     }
+    g_annotEdit = AnnotEdit();
+    g_annotEdit.tabId = t->id;
+    g_annotEdit.idx = t->selIdx;
+    g_annotEdit.original = t->strokes[t->selIdx];
+    g_annotEdit.isNew = (g_pendingNewAnnot == t->selIdx);
+    g_pendingNewAnnot = -1;
+
+    // Stop any drag started by the first click of a double-click
+    g.isDraggingSel = false;
+    g.isResizingSel = false;
+    if (GetCapture() == g.hwndCanvas) ReleaseCapture();
+
+    open = true;
+    DialogBoxParam(nullptr, MAKEINTRESOURCE(IDD_FONT), g.hwndMain, FontDlgProc, 0);
+    open = false;
+    g_annotEdit = AnnotEdit();
+    RefreshChrome();
 }
 
 static void OpenImage(HWND hwnd) {
@@ -1130,6 +2282,7 @@ static void SwitchToTab(int idx) {
     TabCtrl_SetCurSel(g.hwndTab, idx);
     TabData* t = ActiveTab();
     if (t && t->hasImage) FitToWindow();
+    UpdateCanvasScrollBars();
     InvalidateRect(g.hwndCanvas, nullptr, FALSE);
     InvalidateRect(g.hwndMain, nullptr, FALSE);
     RebuildToolbar();
@@ -1145,10 +2298,11 @@ static void CloseTab(int idx) {
         InvalidateRect(g.hwndCanvas, nullptr, TRUE);
     } else {
         if (g.activeTab >= (int)g.tabs.size()) g.activeTab = (int)g.tabs.size() - 1;
-        TabData* t = ActiveTab();
+TabData* t = ActiveTab();
         if (t && t->hasImage) FitToWindow();
     }
     UpdateTabControl();
+    UpdateCanvasScrollBars();
     RebuildToolbar();
     UpdateStatus();
     InvalidateRect(g.hwndCanvas, nullptr, FALSE);
@@ -1183,6 +2337,7 @@ static const IconBtn ICON_BUTTONS[] = {
     { 0, 0 },
     { IDM_CAPTURE_FULLSCREEN, 0xE740 },
     { IDM_CAPTURE_REGION,     0xE8B3 },
+    { IDM_CAPTURE_SCROLLING,  0xEC8F },
     { 0, 0 },
     { IDM_TOOL_SELECT,        0xE7C9 },
     { IDM_TOOL_PEN,           0xE76D },
@@ -1215,6 +2370,7 @@ static const wchar_t* GetTooltipForId(int id) {
     case IDM_EDIT_PASTE:         return L"Paste (Ctrl+V)";
     case IDM_CAPTURE_FULLSCREEN: return L"Capture Fullscreen (F11)";
     case IDM_CAPTURE_REGION:     return L"Capture Region (F12)";
+    case IDM_CAPTURE_SCROLLING:  return L"Scrolling Capture (F10)";
     case IDM_TOOL_SELECT:        return L"Select / Move Shape (V)";
     case IDM_TOOL_PEN:           return L"Pen Tool (Draw freehand)";
     case IDM_TOOL_LINE:          return L"Line Tool";
@@ -1750,80 +2906,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 case Tool::Callout: {
                     if (hPen) { SelectObject(hdcMem, ho); DeleteObject(hPen); hPen = nullptr; }
-                    double zz = T->zoom;
-                    int fs = max(8, (int)(s.fontSize * zz));
-                    HFONT hf = CreateFont(-fs, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
-                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH, s.fontName.c_str());
-                    HFONT hof2 = (HFONT)SelectObject(hdcMem, hf);
-                    SetBkMode(hdcMem, TRANSPARENT);
-                    SetTextColor(hdcMem, s.color);
-                    int pad = (int)(6 * zz);
-                    int maxBubbleW = max(100, (int)(300 * zz));
-                    RECT rcCalc = { 0, 0, maxBubbleW, 10000 };
-                    if (!s.text.empty())
-                        DrawText(hdcMem, s.text.c_str(), (int)s.text.size(), &rcCalc, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT);
-                    int bw = rcCalc.right + pad * 2;
-                    int bh = rcCalc.bottom + pad * 2;
-                    int bx = (int)(s.endPt.x * zz + T->offsetX) - bw / 2;
-                    int by = (int)(s.endPt.y * zz + T->offsetY) - bh / 2;
-                    HBRUSH bgBr = CreateSolidBrush(RGB(255, 255, 255));
-                    HPEN borderPen = CreatePen(PS_SOLID, max(1, (int)(s.penWidth * zz)), s.color);
-                    HBRUSH ob2 = (HBRUSH)SelectObject(hdcMem, bgBr);
-                    HPEN op2 = (HPEN)SelectObject(hdcMem, borderPen);
-                    RoundRect(hdcMem, bx, by, bx + bw, by + bh, (int)(8 * zz), (int)(8 * zz));
-                    SelectObject(hdcMem, ob2);
-                    SelectObject(hdcMem, op2);
-                    DeleteObject(bgBr);
-                    DeleteObject(borderPen);
-                    RECT rcTxt = { bx + pad, by + pad, bx + bw - pad, by + bh - pad };
-                    if (!s.text.empty())
-                        DrawText(hdcMem, s.text.c_str(), (int)s.text.size(), &rcTxt, DT_LEFT | DT_TOP | DT_WORDBREAK);
-                    double acx = s.endPt.x * zz + T->offsetX;
-                    double acy = s.endPt.y * zz + T->offsetY;
-                    double atx = s.startPt.x * zz + T->offsetX;
-                    double aty = s.startPt.y * zz + T->offsetY;
-                    double ang = atan2(aty - acy, atx - acx);
-                    double adx = cos(ang), ady = sin(ang);
-                    double ix = acx, iy = acy;
-                    if (adx > 0) ix = bx + bw; else if (adx < 0) ix = bx;
-                    if (ady > 0) iy = by + bh; else if (ady < 0) iy = by;
-                    if (adx != 0) { double t = (ix - acx) / adx; iy = acy + t * ady; }
-                    if (iy < by || iy > by + bh) {
-                        if (ady > 0) iy = by + bh; else iy = by;
-                        double t = (iy - acy) / ady;
-                        ix = acx + t * adx;
-                    }
-                    HPEN arrPen = CreatePen(PS_SOLID, max(1, (int)(s.penWidth * zz)), s.color);
-                    HPEN op3 = (HPEN)SelectObject(hdcMem, arrPen);
-                    HBRUSH arrBr = CreateSolidBrush(s.color);
-                    HBRUSH ob3 = (HBRUSH)SelectObject(hdcMem, arrBr);
-                    POINT arrowTail = { (int)ix, (int)iy };
-                    POINT arrowTip = { (int)atx, (int)aty };
-                    double adx2 = arrowTip.x - arrowTail.x;
-                    double ady2 = arrowTip.y - arrowTail.y;
-                    double len = sqrt(adx2 * adx2 + ady2 * ady2);
-                    if (len > 1) {
-                        double nx = adx2 / len, ny = ady2 / len;
-                        double hl = max(8.0, 12.0 * zz);
-                        double hw = hl * 0.5;
-                        POINT pts[3] = {
-                            arrowTip,
-                            { (int)(arrowTip.x - nx * hl + ny * hw), (int)(arrowTip.y - ny * hl - nx * hw) },
-                            { (int)(arrowTip.x - nx * hl - ny * hw), (int)(arrowTip.y - ny * hl + nx * hw) }
-                        };
-                        Polygon(hdcMem, pts, 3);
-                        double shaftLen = len - hl * 0.3;
-                        if (shaftLen > 0) {
-                            MoveToEx(hdcMem, (int)(arrowTail.x), (int)(arrowTail.y), nullptr);
-                            LineTo(hdcMem, (int)(arrowTail.x + nx * shaftLen), (int)(arrowTail.y + ny * shaftLen));
-                        }
-                    }
-                    SelectObject(hdcMem, op3);
-                    SelectObject(hdcMem, ob3);
-                    DeleteObject(arrPen);
-                    DeleteObject(arrBr);
-                    SelectObject(hdcMem, hof2);
-                    DeleteObject(hf);
+                    DrawCallout(hdcMem, s, T->zoom, T->offsetX, T->offsetY);
                     break;
                 }
                 default: break;
@@ -1907,21 +2990,17 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     Ellipse(hdcMem, min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey));
                     break;
                 case Tool::Callout: {
-                    int bw = 80, bh = 30;
-                    int cbx = ex - bw / 2, cby = ey - bh / 2;
-                    HBRUSH bgBr = CreateSolidBrush(RGB(255, 255, 255));
-                    HBRUSH ob2 = (HBRUSH)SelectObject(hdcMem, bgBr);
-                    RoundRect(hdcMem, cbx, cby, cbx + bw, cby + bh, 8, 8);
-                    SelectObject(hdcMem, ob2);
-                    DeleteObject(bgBr);
-                    MoveToEx(hdcMem, ex, ey, nullptr);
-                    LineTo(hdcMem, sx, sy);
-                    double a = atan2((double)(ey - sy), (double)(ex - sx));
-                    double hl = max(8.0, 12.0 * zx);
-                    MoveToEx(hdcMem, sx, sy, nullptr);
-                    LineTo(hdcMem, (int)(sx - hl * cos(a - 0.4)), (int)(sy - hl * sin(a - 0.4)));
-                    MoveToEx(hdcMem, sx, sy, nullptr);
-                    LineTo(hdcMem, (int)(sx - hl * cos(a + 0.4)), (int)(sy - hl * sin(a + 0.4)));
+                    // Live preview = exactly what will be placed
+                    Stroke pv;
+                    pv.tool = Tool::Callout;
+                    pv.color = g.penColor;
+                    pv.penWidth = g.penWidth;
+                    pv.startPt = g.drawStart;
+                    pv.endPt = g.drawEnd;
+                    pv.text = L"Text";
+                    pv.fontSize = g.fontSize;
+                    pv.fontName = g.fontName;
+                    DrawCallout(hdcMem, pv, zx, ox, oy);
                     break;
                 }
                 default: break;
@@ -1991,6 +3070,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g.isDraggingSel = true;
                 g.dragStartImg = ip;
                 T->selBackup = T->strokes[hit];
+                SetCapture(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 UpdateStatus();
                 return 0;
@@ -2011,6 +3091,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g.isDraggingSel = true;
                 g.dragStartImg = ip;
                 T->selBackup = T->strokes[hit];
+                SetCapture(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 UpdateStatus();
                 return 0;
@@ -2047,9 +3128,12 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s.fontName = g.fontName;
             s.text = L"Text";
             T->strokes.push_back(s);
+            T->redoStack.clear();
             T->selIdx = (int)T->strokes.size() - 1;
+            g_pendingNewAnnot = T->selIdx;
             g.currentTool = Tool::Select;
             PostMessage(hwnd, WM_DEFER_FONTDLG, 0, 0);
+            RefreshChrome();
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -2065,6 +3149,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g.isDrawing = true;
         g.drawStart = ip;
         g.drawEnd = ip;
+        SetCapture(hwnd);   // keep receiving the mouse until the button is released
 
         if (g.currentTool == Tool::Pen || g.currentTool == Tool::Eraser || g.currentTool == Tool::Highlighter) {
             Stroke s;
@@ -2079,7 +3164,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_LBUTTONDBLCLK: {
-        if (g.currentTool == Tool::Select && T->selIdx >= 0 &&
+        if (T && g.currentTool == Tool::Select && T->selIdx >= 0 && T->selIdx < (int)T->strokes.size() &&
             (T->strokes[T->selIdx].tool == Tool::Text || T->strokes[T->selIdx].tool == Tool::Callout)) {
             PostMessage(hwnd, WM_DEFER_FONTDLG, 0, 0);
         }
@@ -2152,10 +3237,19 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         POINT ip = CanvasToImage(pt);
+        // Whatever this button-up finishes, give the mouse back afterwards.
+        // (Resizing used to keep the capture, so later clicks on the toolbar
+        // were swallowed by the canvas.)
+        struct ReleaseOnExit {
+            HWND h;
+            ~ReleaseOnExit() { if (GetCapture() == h) ReleaseCapture(); }
+        } releaseOnExit{ hwnd };
 
         if (g.isPanning) {
             g.isPanning = false;
             ReleaseCapture();
+            UpdateCanvasScrollBars();
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         if (g.isDraggingSel) {
@@ -2201,12 +3295,20 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     s.text = L"Text";
                     s.fontSize = g.fontSize;
                     s.fontName = g.fontName;
+                    // A plain click (no drag): put the bubble up and to the
+                    // right of the clicked spot so the arrow points at it.
+                    if (abs(s.endPt.x - s.startPt.x) < 6 && abs(s.endPt.y - s.startPt.y) < 6) {
+                        int off = max(60, g.fontSize * 3);
+                        s.endPt = { s.startPt.x + off, s.startPt.y - off };
+                    }
                 }
                 T->strokes.push_back(s);
                 T->redoStack.clear();
                 if (g.currentTool == Tool::Callout) {
                     T->selIdx = (int)T->strokes.size() - 1;
+                    g_pendingNewAnnot = T->selIdx;
                     g.currentTool = Tool::Select;
+                    RefreshChrome();
                     PostMessage(hwnd, WM_DEFER_FONTDLG, 0, 0);
                 }
             } else {
@@ -2217,6 +3319,22 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+
+    case WM_CAPTURECHANGED:
+        // Lost the mouse in the middle of an operation (another window, a
+        // dialog, Alt+Tab): end it cleanly instead of leaving it stuck.
+        if ((HWND)lp != hwnd) {
+            g.isDraggingSel = false;
+            g.isResizingSel = false;
+            g.isPanning = false;
+            if (g.isCropping) g.isCropping = false;
+            if (g.isDrawing) {
+                g.isDrawing = false;   // freehand strokes keep what was drawn
+                if (T) T->redoStack.clear();
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
 
     case WM_MBUTTONDOWN:
     case WM_RBUTTONDOWN:
@@ -2230,7 +3348,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g.isPanning) { g.isPanning = false; ReleaseCapture(); }
         return 0;
 
-    case WM_MOUSEWHEEL: {
+case WM_MOUSEWHEEL: {
         if (!T) return 0;
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         double oldZ = T->zoom;
@@ -2244,6 +3362,61 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         double my = (pt.y - T->offsetY) / oldZ;
         T->offsetX = pt.x - mx * T->zoom;
         T->offsetY = pt.y - my * T->zoom;
+        UpdateCanvasScrollBars();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateStatus();
+        return 0;
+    }
+    case WM_HSCROLL: {
+        TabData* t = ActiveTab();
+        if (!t || !t->hasImage) return 0;
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_HORZ, &si);
+        int pos = si.nPos;
+        switch (LOWORD(wp)) {
+        case SB_LINELEFT:   pos -= 30; break;
+        case SB_LINERIGHT:  pos += 30; break;
+        case SB_PAGELEFT:   pos -= (int)si.nPage; break;
+        case SB_PAGERIGHT:  pos += (int)si.nPage; break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK: pos = si.nTrackPos; break;
+        case SB_LEFT:       pos = si.nMin; break;
+        case SB_RIGHT:      pos = si.nMax - (int)si.nPage; break;
+        }
+        pos = max(si.nMin, min(pos, si.nMax - (int)si.nPage));
+        t->offsetX = -pos;
+        si.fMask = SIF_POS;
+        si.nPos = pos;
+        SetScrollInfo(hwnd, SB_HORZ, &si, TRUE);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateStatus();
+        return 0;
+    }
+    case WM_VSCROLL: {
+        TabData* t = ActiveTab();
+        if (!t || !t->hasImage) return 0;
+        SCROLLINFO si = {};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_ALL;
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int pos = si.nPos;
+        switch (LOWORD(wp)) {
+        case SB_LINEUP:     pos -= 30; break;
+        case SB_LINEDOWN:   pos += 30; break;
+        case SB_PAGEUP:     pos -= (int)si.nPage; break;
+        case SB_PAGEDOWN:   pos += (int)si.nPage; break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK: pos = si.nTrackPos; break;
+        case SB_TOP:        pos = si.nMin; break;
+        case SB_BOTTOM:     pos = si.nMax - (int)si.nPage; break;
+        }
+        pos = max(si.nMin, min(pos, si.nMax - (int)si.nPage));
+        t->offsetY = -pos;
+        si.fMask = SIF_POS;
+        si.nPos = pos;
+        SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
         InvalidateRect(hwnd, nullptr, FALSE);
         UpdateStatus();
         return 0;
@@ -2425,8 +3598,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessage(g.hwndTab, TCM_SETITEMSIZE, 0, MAKELPARAM(120, tabH));
         g_prevTabProc = (WNDPROC)SetWindowLongPtr(g.hwndTab, GWLP_WNDPROC, (LONG_PTR)TabBtnForwardProc);
 
-        g.hwndCanvas = CreateWindowEx(0, L"Static", nullptr,
-            WS_CHILD | WS_VISIBLE | SS_NOTIFY,
+g.hwndCanvas = CreateWindowEx(0, L"Static", nullptr,
+            WS_CHILD | WS_VISIBLE | WS_HSCROLL | WS_VSCROLL | SS_NOTIFY,
             0, 0, 0, 0, hwnd, (HMENU)IDC_CANVAS, nullptr, nullptr);
         SetWindowLongPtr(g.hwndCanvas, GWLP_WNDPROC, (LONG_PTR)CanvasProc);
 
@@ -2450,7 +3623,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_SIZE: {
+case WM_SIZE: {
         RECT rc;
         GetClientRect(hwnd, &rc);
         int stH = 22;
@@ -2461,6 +3634,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessage(g.hStatusbar, WM_SIZE, 0, 0);
         TabData* t = ActiveTab();
         if (t && t->hasImage) FitToWindow();
+        UpdateCanvasScrollBars();
         InvalidateRect(hwnd, nullptr, FALSE);
         InvalidateRect(g.hwndCanvas, nullptr, FALSE);
         UpdateStatus();
@@ -2688,6 +3862,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Overlay_UpdateRegion();
             break;
         }
+        case IDM_CAPTURE_SCROLLING:
+            ScrollCaptureWindow(hwnd);
+            break;
+
 
         case IDM_TOOL_SELECT: g.currentTool = Tool::Select; break;
         case IDM_TOOL_PEN:     g.currentTool = Tool::Pen; break;
@@ -2710,16 +3888,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_COLOR_BTN:     ShowColorDlg(hwnd); break;
         case IDC_PEN_WIDTH:     ShowPenWidthDlg(hwnd); break;
 
-        case IDM_VIEW_ZOOM_IN:
-            if (T) T->zoom = min(T->zoom * 1.25, 30.0);
+case IDM_VIEW_ZOOM_IN:
+            if (T) { T->zoom = min(T->zoom * 1.25, 30.0); UpdateCanvasScrollBars(); }
             InvalidateRect(g.hwndCanvas, nullptr, FALSE);
             break;
         case IDM_VIEW_ZOOM_OUT:
-            if (T) T->zoom = max(T->zoom / 1.25, 0.02);
+            if (T) { T->zoom = max(T->zoom / 1.25, 0.02); UpdateCanvasScrollBars(); }
             InvalidateRect(g.hwndCanvas, nullptr, FALSE);
             break;
         case IDM_VIEW_ZOOM_100:
-            if (T) { T->zoom = 1.0; T->offsetX = 0; T->offsetY = 0; }
+            if (T) { T->zoom = 1.0; T->offsetX = 0; T->offsetY = 0; UpdateCanvasScrollBars(); }
             InvalidateRect(g.hwndCanvas, nullptr, FALSE);
             break;
         case IDM_VIEW_FIT:
@@ -2757,6 +3935,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (ctrl && wp == 'V') { SendMessage(hwnd, WM_COMMAND, IDM_EDIT_PASTE, 0); return 0; }
         if (wp == VK_F11) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_FULLSCREEN, 0); return 0; }
         if (wp == VK_F12) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_REGION, 0); return 0; }
+        if (wp == VK_F10) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_SCROLLING, 0); return 0; }
         if (ctrl && (wp == VK_OEM_PLUS || wp == '+')) { SendMessage(hwnd, WM_COMMAND, IDM_VIEW_ZOOM_IN, 0); return 0; }
         if (ctrl && (wp == VK_OEM_MINUS || wp == '-')) { SendMessage(hwnd, WM_COMMAND, IDM_VIEW_ZOOM_OUT, 0); return 0; }
         if (ctrl && wp == '0') { SendMessage(hwnd, WM_COMMAND, IDM_VIEW_ZOOM_100, 0); return 0; }
@@ -2905,7 +4084,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     UpdateWindow(hwnd);
 
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        // Windows delivers F10 as a system key (it would open the window menu),
+        // so the F10 shortcut never reached WM_KEYDOWN.
+        if (msg.message == WM_SYSKEYDOWN && msg.wParam == VK_F10 &&
+            (GetKeyState(VK_SHIFT) & 0x8000) == 0 &&
+            (msg.hwnd == g.hwndMain || IsChild(g.hwndMain, msg.hwnd))) {
+            PostMessage(g.hwndMain, WM_COMMAND, IDM_CAPTURE_SCROLLING, 0);
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
