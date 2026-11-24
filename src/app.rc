@@ -127,3 +127,19 @@ BEGIN
     DEFPUSHBUTTON   "OK",     IDOK,  50, 150, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 120, 150, 50, 14
 END
+
+IDD_BRIGHTNESS DIALOGEX 0, 0, 240, 110
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Brightness / Contrast"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Brightness:", IDC_STATIC, 10, 14, 45, 10
+    CONTROL         "", IDC_BRIGHT_SLIDER, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 55, 10, 145, 16
+    LTEXT           "0", IDC_BRIGHT_VAL, 205, 14, 25, 10
+    LTEXT           "Contrast:", IDC_STATIC, 10, 42, 45, 10
+    CONTROL         "", IDC_CONTRAST_SLIDER, "msctls_trackbar32", TBS_HORZ | TBS_NOTICKS | WS_TABSTOP, 55, 38, 145, 16
+    LTEXT           "0", IDC_CONTRAST_VAL, 205, 42, 25, 10
+    PUSHBUTTON      "Reset",  IDC_BC_RESET, 10, 86, 50, 14
+    DEFPUSHBUTTON   "OK",     IDOK,  120, 86, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 180, 86, 50, 14
+END

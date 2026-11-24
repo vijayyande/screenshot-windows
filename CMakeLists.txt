@@ -17,6 +17,7 @@ target_link_libraries(ScreenCapture PRIVATE
     comdlg32
     gdiplus
     vfw32
+    uxtheme
 )
 
 target_compile_definitions(ScreenCapture PRIVATE
@@ -27,4 +28,7 @@ target_compile_definitions(ScreenCapture PRIVATE
 
 if(MSVC)
     target_compile_options(ScreenCapture PRIVATE /W4)
+    # Embed the manifest (modern common controls) inside the exe so it still
+    # applies when the exe is copied somewhere else on its own.
+    target_link_options(ScreenCapture PRIVATE /MANIFEST:EMBED)
 endif()

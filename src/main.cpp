@@ -11,6 +11,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
 #include <gdiplus.h>
 #include <vfw.h>
 #include <vector>
@@ -22,6 +23,7 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "vfw32.lib")
 
@@ -32,7 +34,7 @@ using namespace Gdiplus;
 static const wchar_t* APP_CLASS = L"ScreenshotEditorClass";
 static const wchar_t* APP_TITLE = L"Screenshot Editor";
 
-enum class Tool { Select, Pen, Line, Rectangle, Ellipse, Arrow, Eraser, Fill, Crop, Text, Callout, Highlighter, None };
+enum class Tool { Select, Pen, Line, Rectangle, Ellipse, Arrow, Eraser, Fill, Crop, Text, Callout, Highlighter, Pixelate, None };
 enum class CaptureMode { None, Region };
 
 struct Stroke {
@@ -48,7 +50,18 @@ struct Stroke {
     std::wstring fontName = L"Arial";
 };
 
+// A saved image state for undoing destructive image edits (rotate, filters...).
+struct ImgSnap {
+    HBITMAP bmp = nullptr;
+    int w = 0, h = 0;
+    std::vector<Stroke> strokes;   // annotations that were live at the time
+    size_t strokeCount = 0;        // redo only: strokes present when it was undone
+};
+
 struct TabData {
+    std::vector<ImgSnap> imgUndo;
+    std::vector<ImgSnap> imgRedo;
+    bool fitMode = true;           // keep fitting to the window when it resizes
     HBITMAP hBitmap = nullptr;
     int imgW = 0, imgH = 0;
     bool hasImage = false;
@@ -83,7 +96,7 @@ struct App {
     HWND hwndTab = nullptr;
     std::vector<HWND> tabCloseBtns;
 
-    int toolbarH = 64;
+    int toolbarH = 40;
     int tabH = 24;
     int hoverBtn = -1;
 
@@ -1468,11 +1481,14 @@ static void UpdateCanvasScrollBars() {
     GetClientRect(g.hwndCanvas, &rc);
     int cw = rc.right, ch = rc.bottom;
 
+    // The bars are always shown (greyed out when the whole image fits) so the
+    // canvas size does not jump when they would appear or disappear.
+    SCROLLINFO si = {};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+
     if (!t || !t->hasImage || cw < 1 || ch < 1) {
-        SCROLLINFO si = {};
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_ALL;
-        si.nMin = 0; si.nMax = 0; si.nPage = 0; si.nPos = 0;
+        si.nMin = 0; si.nMax = 0; si.nPage = 1; si.nPos = 0;
         SetScrollInfo(g.hwndCanvas, SB_HORZ, &si, TRUE);
         SetScrollInfo(g.hwndCanvas, SB_VERT, &si, TRUE);
         return;
@@ -1481,27 +1497,21 @@ static void UpdateCanvasScrollBars() {
     int dw = (int)(t->imgW * t->zoom);
     int dh = (int)(t->imgH * t->zoom);
 
-    SCROLLINFO si = {};
-    si.cbSize = sizeof(si);
-    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-
     if (dw > cw) {
-        int hMax = dw - cw;
-        t->offsetX = max(-(double)hMax, min(0.0, t->offsetX));
-        si.nMin = 0; si.nMax = dw; si.nPage = cw; si.nPos = (int)(-t->offsetX);
+        t->offsetX = max(-(double)(dw - cw), min(0.0, t->offsetX));
+        si.nMin = 0; si.nMax = dw - 1; si.nPage = cw; si.nPos = (int)lround(-t->offsetX);
     } else {
         t->offsetX = (cw - dw) / 2.0;
-        si.nMin = 0; si.nMax = 0; si.nPage = 0; si.nPos = 0;
+        si.nMin = 0; si.nMax = 0; si.nPage = 1; si.nPos = 0;
     }
     SetScrollInfo(g.hwndCanvas, SB_HORZ, &si, TRUE);
 
     if (dh > ch) {
-        int vMax = dh - ch;
-        t->offsetY = max(-(double)vMax, min(0.0, t->offsetY));
-        si.nMin = 0; si.nMax = dh; si.nPage = ch; si.nPos = (int)(-t->offsetY);
+        t->offsetY = max(-(double)(dh - ch), min(0.0, t->offsetY));
+        si.nMin = 0; si.nMax = dh - 1; si.nPage = ch; si.nPos = (int)lround(-t->offsetY);
     } else {
         t->offsetY = (ch - dh) / 2.0;
-        si.nMin = 0; si.nMax = 0; si.nPage = 0; si.nPos = 0;
+        si.nMin = 0; si.nMax = 0; si.nPage = 1; si.nPos = 0;
     }
     SetScrollInfo(g.hwndCanvas, SB_VERT, &si, TRUE);
 }
@@ -1517,7 +1527,39 @@ static void FitToWindow() {
     t->zoom = min(sx, sy) * 0.92;
     t->offsetX = (rc.right - t->imgW * t->zoom) / 2.0;
     t->offsetY = (rc.bottom - t->imgH * t->zoom) / 2.0;
+    t->fitMode = true;
     UpdateCanvasScrollBars();
+}
+
+// Zooms the active tab to `newZoom`, keeping the image point under the canvas
+// point (cx, cy) fixed. Pass cx = cy = INT_MIN to zoom around the centre.
+static void ZoomAt(double newZoom, int cx = INT_MIN, int cy = INT_MIN) {
+    TabData* t = ActiveTab();
+    if (!t || !t->hasImage || !g.hwndCanvas) return;
+    if (cx == INT_MIN) {
+        RECT rc;
+        GetClientRect(g.hwndCanvas, &rc);
+        cx = rc.right / 2; cy = rc.bottom / 2;
+    }
+    newZoom = max(0.02, min(newZoom, 30.0));
+    double mx = (cx - t->offsetX) / t->zoom;
+    double my = (cy - t->offsetY) / t->zoom;
+    t->zoom = newZoom;
+    t->offsetX = cx - mx * t->zoom;
+    t->offsetY = cy - my * t->zoom;
+    t->fitMode = false;
+    UpdateCanvasScrollBars();
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+}
+
+// Scrolls the view by (dx, dy) screen pixels (positive = towards bottom/right).
+static void ScrollCanvasBy(int dx, int dy) {
+    TabData* t = ActiveTab();
+    if (!t || !t->hasImage) return;
+    t->offsetX -= dx;
+    t->offsetY -= dy;
+    UpdateCanvasScrollBars();
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
 }
 
 static POINT CanvasToImage(POINT pt) {
@@ -1697,6 +1739,8 @@ static void ShowPenWidthDlg(HWND parent) {
         }, 0);
 }
 
+static bool PushImageUndo(TabData* t);
+
 static void ShowResizeDlg(HWND parent) {
     TabData* t = ActiveTab();
     if (!t) return;
@@ -1740,6 +1784,7 @@ static void ShowResizeDlg(HWND parent) {
                     if (nw * ar > nh) nh = (int)(nw / ar);
                     else nw = (int)(nh * ar);
                 }
+                PushImageUndo(t);
                 FlattenToBitmap();
                 HDC hdcScr = GetDC(nullptr);
                 HBITMAP hNew = CreateCompatibleBitmap(hdcScr, nw, nh);
@@ -1873,6 +1918,349 @@ static void CropImage(int x, int y, int w, int h) {
     InvalidateRect(g.hwndCanvas, nullptr, FALSE);
     UpdateStatus();
     UpdateTabControl();
+}
+
+// ---------------------------------------------------------------------------
+// Image editing: pixel access, undoable image operations and filters.
+// Pixels are 32-bit 0x00RRGGBB, top-down, row-major.
+// ---------------------------------------------------------------------------
+
+static bool ReadPixels(HBITMAP hb, int w, int h, std::vector<DWORD>& px) {
+    if (!hb || w < 1 || h < 1) return false;
+    px.assign((size_t)w * h, 0);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC hdc = GetDC(nullptr);
+    int lines = GetDIBits(hdc, hb, 0, h, px.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, hdc);
+    return lines == h;
+}
+
+static HBITMAP PixelsToBitmap(const std::vector<DWORD>& px, int w, int h) {
+    void* bits = nullptr;
+    HBITMAP hb = CreateDib32(w, h, &bits);
+    if (!hb || !bits) return nullptr;
+    DWORD* d = (DWORD*)bits;
+    for (size_t i = 0, n = (size_t)w * h; i < n; i++) d[i] = px[i] | 0xFF000000;
+    return hb;
+}
+
+static HBITMAP CopyBitmapPixels(HBITMAP hb, int w, int h) {
+    std::vector<DWORD> px;
+    if (!ReadPixels(hb, w, h, px)) return nullptr;
+    return PixelsToBitmap(px, w, h);
+}
+
+static void FreeSnaps(std::vector<ImgSnap>& v) {
+    for (auto& s : v) if (s.bmp) DeleteObject(s.bmp);
+    v.clear();
+}
+
+static const size_t MAX_IMG_UNDO = 20;
+
+// Saves the current bitmap and annotations so the next image edit can be undone.
+static bool PushImageUndo(TabData* t) {
+    if (!t || !t->hasImage) return false;
+    ImgSnap s;
+    s.bmp = CopyBitmapPixels(t->hBitmap, t->imgW, t->imgH);
+    if (!s.bmp) return false;
+    s.w = t->imgW; s.h = t->imgH;
+    s.strokes = t->strokes;
+    t->imgUndo.push_back(std::move(s));
+    if (t->imgUndo.size() > MAX_IMG_UNDO) {
+        DeleteObject(t->imgUndo.front().bmp);
+        t->imgUndo.erase(t->imgUndo.begin());
+    }
+    FreeSnaps(t->imgRedo);
+    return true;
+}
+
+static bool CanImageRedo(TabData* t) {
+    return t && !t->imgRedo.empty() && t->redoStack.empty() &&
+           t->strokes.size() == t->imgRedo.back().strokeCount;
+}
+
+// Moves the current state onto `to` and restores the last state from `from`.
+static void SwapImageState(TabData* t, std::vector<ImgSnap>& from, std::vector<ImgSnap>& to) {
+    ImgSnap cur;
+    cur.bmp = t->hBitmap; cur.w = t->imgW; cur.h = t->imgH;
+    cur.strokes = t->strokes;
+    ImgSnap prev = std::move(from.back());
+    from.pop_back();
+    t->hBitmap = prev.bmp; t->imgW = prev.w; t->imgH = prev.h;
+    t->strokes = std::move(prev.strokes);
+    t->redoStack.clear();
+    t->selIdx = -1;
+    cur.strokeCount = t->strokes.size();
+    bool sizeChanged = cur.w != t->imgW || cur.h != t->imgH;
+    to.push_back(std::move(cur));
+    if (sizeChanged) FitToWindow();
+    else UpdateCanvasScrollBars();
+}
+
+static void ImageUndo(TabData* t) { if (t && !t->imgUndo.empty()) SwapImageState(t, t->imgUndo, t->imgRedo); }
+static void ImageRedo(TabData* t) { if (CanImageRedo(t)) SwapImageState(t, t->imgRedo, t->imgUndo); }
+
+static inline int Clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+static inline DWORD MkPx(int r, int gg, int b) { return ((DWORD)Clamp255(r) << 16) | ((DWORD)Clamp255(gg) << 8) | (DWORD)Clamp255(b); }
+#define PX_R(p) ((int)(((p) >> 16) & 0xFF))
+#define PX_G(p) ((int)(((p) >> 8) & 0xFF))
+#define PX_B(p) ((int)((p) & 0xFF))
+
+static void BoxBlur(std::vector<DWORD>& px, int w, int h, int r) {
+    std::vector<DWORD> tmp(px.size());
+    for (int pass = 0; pass < 2; pass++) {
+        const std::vector<DWORD>& src = pass == 0 ? px : tmp;
+        std::vector<DWORD>& dst = pass == 0 ? tmp : px;
+        int len = pass == 0 ? w : h, lines = pass == 0 ? h : w;
+        for (int l = 0; l < lines; l++) {
+            auto at = [&](int i) -> size_t { return pass == 0 ? (size_t)l * w + i : (size_t)i * w + l; };
+            int sr = 0, sg = 0, sb = 0, cnt = 0;
+            for (int i = 0; i <= r && i < len; i++) { DWORD p = src[at(i)]; sr += PX_R(p); sg += PX_G(p); sb += PX_B(p); cnt++; }
+            for (int i = 0; i < len; i++) {
+                dst[at(i)] = MkPx(sr / cnt, sg / cnt, sb / cnt);
+                int add = i + r + 1, rem = i - r;
+                if (add < len) { DWORD p = src[at(add)]; sr += PX_R(p); sg += PX_G(p); sb += PX_B(p); cnt++; }
+                if (rem >= 0) { DWORD p = src[at(rem)]; sr -= PX_R(p); sg -= PX_G(p); sb -= PX_B(p); cnt--; }
+            }
+        }
+    }
+}
+
+static void ApplyBrightnessContrast(std::vector<DWORD>& px, int bright, int contrast) {
+    double c = contrast * 2.55;
+    double f = (259.0 * (c + 255.0)) / (255.0 * (259.0 - c));
+    double b = bright * 2.55;
+    int lut[256];
+    for (int i = 0; i < 256; i++) lut[i] = Clamp255((int)lround(f * (i - 128) + 128 + b));
+    for (auto& p : px) p = MkPx(lut[PX_R(p)], lut[PX_G(p)], lut[PX_B(p)]);
+}
+
+// Runs one image operation on the active tab. Annotations are baked in first
+// and everything is undoable with Ctrl+Z.
+static void ApplyImageOp(int op) {
+    TabData* t = ActiveTab();
+    if (!t || !t->hasImage) return;
+    if (!PushImageUndo(t)) return;
+    FlattenToBitmap();
+    t->selIdx = -1;
+
+    int w = t->imgW, h = t->imgH;
+    std::vector<DWORD> src;
+    if (!ReadPixels(t->hBitmap, w, h, src)) return;
+    std::vector<DWORD> dst;
+    int nw = w, nh = h;
+
+    switch (op) {
+    case IDM_IMAGE_ROT_RIGHT:
+        nw = h; nh = w; dst.resize(src.size());
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                dst[(size_t)x * nw + (h - 1 - y)] = src[(size_t)y * w + x];
+        break;
+    case IDM_IMAGE_ROT_LEFT:
+        nw = h; nh = w; dst.resize(src.size());
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                dst[(size_t)(w - 1 - x) * nw + y] = src[(size_t)y * w + x];
+        break;
+    case IDM_IMAGE_ROT_180:
+        dst.assign(src.rbegin(), src.rend());
+        break;
+    case IDM_IMAGE_FLIP_H:
+        dst = src;
+        for (int y = 0; y < h; y++) std::reverse(dst.begin() + (size_t)y * w, dst.begin() + (size_t)(y + 1) * w);
+        break;
+    case IDM_IMAGE_FLIP_V:
+        dst.resize(src.size());
+        for (int y = 0; y < h; y++)
+            std::copy(src.begin() + (size_t)y * w, src.begin() + (size_t)(y + 1) * w, dst.begin() + (size_t)(h - 1 - y) * w);
+        break;
+    case IDM_IMAGE_GRAYSCALE:
+        dst = src;
+        for (auto& p : dst) { int l = (PX_R(p) * 299 + PX_G(p) * 587 + PX_B(p) * 114) / 1000; p = MkPx(l, l, l); }
+        break;
+    case IDM_IMAGE_SEPIA:
+        dst = src;
+        for (auto& p : dst) {
+            int r = PX_R(p), gg = PX_G(p), b = PX_B(p);
+            p = MkPx((r * 393 + gg * 769 + b * 189) / 1000,
+                     (r * 349 + gg * 686 + b * 168) / 1000,
+                     (r * 272 + gg * 534 + b * 131) / 1000);
+        }
+        break;
+    case IDM_IMAGE_INVERT:
+        dst = src;
+        for (auto& p : dst) p = (~p) & 0x00FFFFFF;
+        break;
+    case IDM_IMAGE_BLUR:
+        dst = src;
+        BoxBlur(dst, w, h, 2);
+        break;
+    case IDM_IMAGE_SHARPEN:
+        dst = src;
+        for (int y = 1; y < h - 1; y++)
+            for (int x = 1; x < w - 1; x++) {
+                size_t i = (size_t)y * w + x;
+                DWORD c = src[i], l = src[i - 1], r = src[i + 1], u = src[i - w], d = src[i + w];
+                dst[i] = MkPx(5 * PX_R(c) - PX_R(l) - PX_R(r) - PX_R(u) - PX_R(d),
+                              5 * PX_G(c) - PX_G(l) - PX_G(r) - PX_G(u) - PX_G(d),
+                              5 * PX_B(c) - PX_B(l) - PX_B(r) - PX_B(u) - PX_B(d));
+            }
+        break;
+    case IDM_IMAGE_BORDER: {
+        int bw = max(1, g.penWidth);
+        nw = w + 2 * bw; nh = h + 2 * bw;
+        dst.assign((size_t)nw * nh, MkPx(GetRValue(g.penColor), GetGValue(g.penColor), GetBValue(g.penColor)));
+        for (int y = 0; y < h; y++)
+            std::copy(src.begin() + (size_t)y * w, src.begin() + (size_t)(y + 1) * w,
+                      dst.begin() + (size_t)(y + bw) * nw + bw);
+        break;
+    }
+    default:
+        return;
+    }
+
+    HBITMAP hNew = PixelsToBitmap(dst, nw, nh);
+    if (!hNew) return;
+    DeleteObject(t->hBitmap);
+    t->hBitmap = hNew;
+    t->imgW = nw; t->imgH = nh;
+    if (nw != w || nh != h) FitToWindow();
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+}
+
+// Pixelates a rectangle of the image (for hiding text, faces, etc.).
+static void PixelateRegion(int x, int y, int w, int h) {
+    TabData* t = ActiveTab();
+    if (!t || !t->hasImage) return;
+    int x0 = max(0, x), y0 = max(0, y);
+    int x1 = min(t->imgW, x + w), y1 = min(t->imgH, y + h);
+    if (x1 - x0 < 2 || y1 - y0 < 2) return;
+    if (!PushImageUndo(t)) return;
+    FlattenToBitmap();
+    std::vector<DWORD> px;
+    if (!ReadPixels(t->hBitmap, t->imgW, t->imgH, px)) return;
+    int block = max(6, min(20, min(x1 - x0, y1 - y0) / 6));
+    for (int by = y0; by < y1; by += block)
+        for (int bx = x0; bx < x1; bx += block) {
+            int ex = min(bx + block, x1), ey = min(by + block, y1);
+            long long sr = 0, sg = 0, sb = 0, n = 0;
+            for (int yy = by; yy < ey; yy++)
+                for (int xx = bx; xx < ex; xx++) {
+                    DWORD p = px[(size_t)yy * t->imgW + xx];
+                    sr += PX_R(p); sg += PX_G(p); sb += PX_B(p); n++;
+                }
+            DWORD avg = MkPx((int)(sr / n), (int)(sg / n), (int)(sb / n));
+            for (int yy = by; yy < ey; yy++)
+                for (int xx = bx; xx < ex; xx++) px[(size_t)yy * t->imgW + xx] = avg;
+        }
+    HBITMAP hNew = PixelsToBitmap(px, t->imgW, t->imgH);
+    if (!hNew) return;
+    DeleteObject(t->hBitmap);
+    t->hBitmap = hNew;
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+}
+
+// Brightness / contrast dialog with live preview.
+struct BCState {
+    TabData* t;
+    std::vector<DWORD> orig;
+};
+
+static void BC_Preview(HWND hDlg, BCState* st) {
+    int b = (int)SendDlgItemMessage(hDlg, IDC_BRIGHT_SLIDER, TBM_GETPOS, 0, 0);
+    int c = (int)SendDlgItemMessage(hDlg, IDC_CONTRAST_SLIDER, TBM_GETPOS, 0, 0);
+    wchar_t buf[16];
+    swprintf_s(buf, L"%d", b); SetDlgItemText(hDlg, IDC_BRIGHT_VAL, buf);
+    swprintf_s(buf, L"%d", c); SetDlgItemText(hDlg, IDC_CONTRAST_VAL, buf);
+    std::vector<DWORD> px = st->orig;
+    if (b != 0 || c != 0) ApplyBrightnessContrast(px, b, c);
+    HBITMAP hNew = PixelsToBitmap(px, st->t->imgW, st->t->imgH);
+    if (!hNew) return;
+    DeleteObject(st->t->hBitmap);
+    st->t->hBitmap = hNew;
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+    UpdateWindow(g.hwndCanvas);
+}
+
+static void ShowBrightnessDlg(HWND parent) {
+    TabData* t = ActiveTab();
+    if (!t || !t->hasImage) return;
+    if (!PushImageUndo(t)) return;
+    FlattenToBitmap();
+    t->selIdx = -1;
+    BCState st{ t, {} };
+    if (!ReadPixels(t->hBitmap, t->imgW, t->imgH, st.orig)) { ImageUndo(t); FreeSnaps(t->imgRedo); return; }
+    INT_PTR res = DialogBoxParam(nullptr, MAKEINTRESOURCE(IDD_BRIGHTNESS), parent,
+        [](HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) -> INT_PTR {
+            BCState* st = (BCState*)GetWindowLongPtr(hDlg, DWLP_USER);
+            switch (msg) {
+            case WM_INITDIALOG:
+                SetWindowLongPtr(hDlg, DWLP_USER, lp);
+                for (int id : { IDC_BRIGHT_SLIDER, IDC_CONTRAST_SLIDER }) {
+                    SendDlgItemMessage(hDlg, id, TBM_SETRANGE, TRUE, MAKELPARAM(-100, 100));
+                    SendDlgItemMessage(hDlg, id, TBM_SETPAGESIZE, 0, 10);
+                    SendDlgItemMessage(hDlg, id, TBM_SETPOS, TRUE, 0);
+                }
+                return TRUE;
+            case WM_HSCROLL:
+                if (st) BC_Preview(hDlg, st);
+                return TRUE;
+            case WM_COMMAND:
+                if (LOWORD(wp) == IDC_BC_RESET && st) {
+                    SendDlgItemMessage(hDlg, IDC_BRIGHT_SLIDER, TBM_SETPOS, TRUE, 0);
+                    SendDlgItemMessage(hDlg, IDC_CONTRAST_SLIDER, TBM_SETPOS, TRUE, 0);
+                    BC_Preview(hDlg, st);
+                    return TRUE;
+                }
+                if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+                    EndDialog(hDlg, LOWORD(wp));
+                    return TRUE;
+                }
+                break;
+            case WM_CLOSE:
+                EndDialog(hDlg, IDCANCEL);
+                return TRUE;
+            }
+            return FALSE;
+        }, (LPARAM)&st);
+    if (res != IDOK) {
+        // Throw away the preview and restore the untouched image and annotations.
+        ImageUndo(t);
+        FreeSnaps(t->imgRedo);
+    }
+    InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+}
+
+static void ShowImageMenu(HWND hwnd, int x, int y) {
+    HMENU hm = CreatePopupMenu();
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_ROT_LEFT,  L"Rotate Left\tCtrl+L");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_ROT_RIGHT, L"Rotate Right\tCtrl+R");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_ROT_180,   L"Rotate 180°");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_FLIP_H,    L"Flip Horizontal");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_FLIP_V,    L"Flip Vertical");
+    AppendMenu(hm, MF_SEPARATOR, 0, nullptr);
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_BRIGHTNESS, L"Brightness / Contrast...");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_GRAYSCALE, L"Grayscale");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_SEPIA,     L"Sepia");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_INVERT,    L"Invert Colors");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_BLUR,      L"Blur");
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_SHARPEN,   L"Sharpen");
+    AppendMenu(hm, MF_SEPARATOR, 0, nullptr);
+    wchar_t border[64];
+    swprintf_s(border, L"Add Border (%d px, pen color)", max(1, g.penWidth));
+    AppendMenu(hm, MF_STRING, IDM_IMAGE_BORDER, border);
+    AppendMenu(hm, MF_STRING, IDM_TOOL_PIXELATE,   L"Pixelate Region");
+    AppendMenu(hm, MF_STRING, IDM_EDIT_CROP,       L"Crop...");
+    AppendMenu(hm, MF_STRING, IDM_EDIT_RESIZE,     L"Resize...");
+    TrackPopupMenu(hm, TPM_LEFTALIGN | TPM_TOPALIGN, x, y, 0, hwnd, nullptr);
+    DestroyMenu(hm);
 }
 
 static void ShowAboutDlg(HWND parent) {
@@ -2219,7 +2607,7 @@ static void NewCanvas(HWND hwnd) {
 static void UpdateStatus() {
     if (!g.hStatusbar) return;
     wchar_t buf[256];
-    const wchar_t* names[] = { L"Select", L"Pen", L"Line", L"Rectangle", L"Ellipse", L"Arrow", L"Eraser", L"Fill", L"Crop", L"Text", L"Callout", L"Highlighter", L"None" };
+    const wchar_t* names[] = { L"Select", L"Pen", L"Line", L"Rectangle", L"Ellipse", L"Arrow", L"Eraser", L"Fill", L"Crop", L"Text", L"Callout", L"Highlighter", L"Pixelate", L"None" };
     int ti = (int)g.currentTool;
     TabData* t = ActiveTab();
     if (t && t->hasImage) {
@@ -2292,6 +2680,8 @@ static void SwitchToTab(int idx) {
 static void CloseTab(int idx) {
     if (idx < 0 || idx >= (int)g.tabs.size()) return;
     if (g.tabs[idx].hBitmap) DeleteObject(g.tabs[idx].hBitmap);
+    FreeSnaps(g.tabs[idx].imgUndo);
+    FreeSnaps(g.tabs[idx].imgRedo);
     g.tabs.erase(g.tabs.begin() + idx);
     if (g.tabs.empty()) {
         g.activeTab = -1;
@@ -2308,8 +2698,16 @@ TabData* t = ActiveTab();
     InvalidateRect(g.hwndCanvas, nullptr, FALSE);
 }
 
-static void DrawFontIcon(HDC hdc, int cx, int cy, wchar_t glyph, COLORREF c) {
-    HFONT hf = CreateFontW(-28, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+static void DrawFontIcon(HDC hdc, int cx, int cy, wchar_t glyph, COLORREF c, bool mirror = false) {
+    int oldMode = 0;
+    XFORM oldXf = {};
+    if (mirror) {
+        oldMode = SetGraphicsMode(hdc, GM_ADVANCED);
+        GetWorldTransform(hdc, &oldXf);
+        XFORM xf = { -1.0f, 0.0f, 0.0f, 1.0f, (FLOAT)(2 * cx), 0.0f };
+        SetWorldTransform(hdc, &xf);
+    }
+    HFONT hf = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
     HFONT old = (HFONT)SelectObject(hdc, hf);
@@ -2321,6 +2719,10 @@ static void DrawFontIcon(HDC hdc, int cx, int cy, wchar_t glyph, COLORREF c) {
     TextOutW(hdc, cx - sz.cx / 2, cy - sz.cy / 2, str, 1);
     SelectObject(hdc, old);
     DeleteObject(hf);
+    if (mirror) {
+        SetWorldTransform(hdc, &oldXf);
+        SetGraphicsMode(hdc, oldMode);
+    }
 }
 
 struct IconBtn { int id; wchar_t glyph; };
@@ -2350,6 +2752,12 @@ static const IconBtn ICON_BUTTONS[] = {
     { IDM_TOOL_TEXT,          0xE8D2 },
     { IDM_TOOL_CALLOUT,      0xE90A },
     { IDM_TOOL_HIGHLIGHTER,  0xE891 },
+    { IDM_TOOL_PIXELATE,     0xE80A },
+    { 0, 0 },
+    { IDM_IMAGE_ROT_LEFT,    0xE7AD },
+    { IDM_IMAGE_ROT_RIGHT,   0xE7AD },
+    { IDM_IMAGE_FLIP_H,      0xE8AB },
+    { IDM_IMAGE_MENU,        0xE9E9 },
     { 0, 0 },
     { IDM_RECORD_TOGGLE,     0xE768 },
     { 0, 0 },
@@ -2387,6 +2795,11 @@ static const wchar_t* GetTooltipForId(int id) {
     case IDM_EDIT_CROP:          return L"Crop Image";
     case IDM_EDIT_RESIZE:        return L"Resize Image";
     case IDM_RECORD_TOGGLE:      return L"Start / Stop Screen Recording (2 fps)";
+    case IDM_TOOL_PIXELATE:      return L"Pixelate Tool (Drag to blur out a region)";
+    case IDM_IMAGE_ROT_LEFT:     return L"Rotate Left (Ctrl+L)";
+    case IDM_IMAGE_ROT_RIGHT:    return L"Rotate Right (Ctrl+R)";
+    case IDM_IMAGE_FLIP_H:       return L"Flip Horizontal";
+    case IDM_IMAGE_MENU:         return L"Image Adjustments (flip, grayscale, brightness, blur...)";
     default: return L"";
     }
 }
@@ -2620,36 +3033,89 @@ static void RebuildToolbar() {
     g.tbBtns.clear();
     TabData* t = ActiveTab();
     int x = 4;
-    int bh = 50;
+    int bh = 32;
     int by = (g.toolbarH - bh) / 2;
-    int btnW = 50;
+    int btnW = 32;
 
     for (int i = 0; i < _countof(ICON_BUTTONS); i++) {
         if (ICON_BUTTONS[i].glyph == 0) {
-            g.tbBtns.push_back({ 0, x, by, 8, bh, true, true });
-            x += 10;
+            g.tbBtns.push_back({ 0, x, by, 7, bh, true, true });
+            x += 8;
         } else {
             bool enabled = true;
-            if (ICON_BUTTONS[i].id == IDM_EDIT_UNDO) enabled = t && !t->strokes.empty();
-            if (ICON_BUTTONS[i].id == IDM_EDIT_REDO) enabled = t && !t->redoStack.empty();
+            if (ICON_BUTTONS[i].id == IDM_EDIT_UNDO) enabled = t && (!t->strokes.empty() || !t->imgUndo.empty());
+            if (ICON_BUTTONS[i].id == IDM_EDIT_REDO) enabled = t && (!t->redoStack.empty() || CanImageRedo(t));
+            if (ICON_BUTTONS[i].id >= IDM_IMAGE_MENU && ICON_BUTTONS[i].id <= IDM_IMAGE_BORDER)
+                enabled = t && t->hasImage;
             g.tbBtns.push_back({ ICON_BUTTONS[i].id, x, by, btnW, bh, false, enabled });
             x += btnW + 1;
         }
     }
 
-    if (g.hwndTooltip) {
-        SendMessage(g.hwndTooltip, TTM_DELTOOL, 0, (LPARAM)"Toolbar");
-        for (auto& b : g.tbBtns) {
-            if (b.isSep) continue;
-            TOOLINFO ti = {};
-            ti.cbSize = sizeof(ti);
-            ti.uFlags = TTF_SUBCLASS;
-            ti.hwnd = g.hwndMain;
-            ti.lpszText = (LPWSTR)GetTooltipForId(b.id);
-            ti.rect = { b.x, b.y, b.x + b.w, b.y + b.h };
-            SendMessage(g.hwndTooltip, TTM_ADDTOOL, 0, (LPARAM)&ti);
-        }
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar tooltips. The toolbar is custom-drawn, so instead of relying on the
+// tooltip control's own hover detection (which never fired reliably here) we
+// track the hovered button ourselves and show one "tracking" tooltip under it.
+// ---------------------------------------------------------------------------
+static const UINT_PTR TIP_TIMER_ID = 3002;
+static const UINT TIP_DELAY_MS = 400;
+static bool g_tipShown = false;
+static bool g_trackingLeave = false;
+
+static TOOLINFO TipToolInfo() {
+    TOOLINFO ti = {};
+    // The V2 size is accepted by every comctl32 version. sizeof(TOOLINFO) is
+    // the V3 size, which the old (v5) library rejects, so when the exe ran
+    // without its manifest no tooltip was ever registered.
+    ti.cbSize = TTTOOLINFOW_V2_SIZE;
+    ti.hwnd = g.hwndMain;
+    ti.uId = 1;
+    return ti;
+}
+
+static void CreateToolbarTooltip(HWND hwnd) {
+    g.hwndTooltip = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    SendMessage(g.hwndTooltip, TTM_SETMAXTIPWIDTH, 0, 400);
+    TOOLINFO ti = TipToolInfo();
+    ti.uFlags = TTF_TRACK | TTF_ABSOLUTE;
+    ti.lpszText = (LPWSTR)L"";
+    SendMessage(g.hwndTooltip, TTM_ADDTOOL, 0, (LPARAM)&ti);
+}
+
+static void HideToolbarTip() {
+    if (g.hwndMain) KillTimer(g.hwndMain, TIP_TIMER_ID);
+    if (g_tipShown && g.hwndTooltip) {
+        TOOLINFO ti = TipToolInfo();
+        SendMessage(g.hwndTooltip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
     }
+    g_tipShown = false;
+}
+
+static void ShowToolbarTip(int btnIdx) {
+    if (!g.hwndTooltip || btnIdx < 0 || btnIdx >= (int)g.tbBtns.size()) return;
+    const auto& b = g.tbBtns[btnIdx];
+    const wchar_t* text = GetTooltipForId(b.id);
+    if (b.isSep || !text || !*text) { HideToolbarTip(); return; }
+    TOOLINFO ti = TipToolInfo();
+    ti.lpszText = (LPWSTR)text;
+    SendMessage(g.hwndTooltip, TTM_UPDATETIPTEXT, 0, (LPARAM)&ti);
+    POINT pt = { b.x, b.y + b.h + 4 };
+    ClientToScreen(g.hwndMain, &pt);
+    SendMessage(g.hwndTooltip, TTM_TRACKPOSITION, 0, MAKELPARAM((WORD)(short)pt.x, (WORD)(short)pt.y));
+    SendMessage(g.hwndTooltip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+    g_tipShown = true;
+}
+
+// Called whenever the hovered toolbar button changes (-1 = none).
+static void OnToolbarHoverChanged(int newIdx) {
+    if (newIdx < 0) { HideToolbarTip(); return; }
+    if (g_tipShown) ShowToolbarTip(newIdx);          // already showing: follow at once
+    else SetTimer(g.hwndMain, TIP_TIMER_ID, TIP_DELAY_MS, nullptr);
 }
 
 static void RenderToolbar(HDC hdc, RECT& rc) {
@@ -2690,6 +3156,8 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
         else if (b.id == IDM_TOOL_FILL) selected = (g.currentTool == Tool::Fill);
         else if (b.id == IDM_TOOL_CALLOUT) selected = (g.currentTool == Tool::Callout);
         else if (b.id == IDM_TOOL_HIGHLIGHTER) selected = (g.currentTool == Tool::Highlighter);
+        else if (b.id == IDM_TOOL_PIXELATE) selected = (g.currentTool == Tool::Pixelate);
+        else if (b.id == IDM_EDIT_CROP) selected = (g.currentTool == Tool::Crop);
 
         if (selected) {
             HBRUSH hbs = CreateSolidBrush(RGB(0, 122, 204));
@@ -2721,7 +3189,7 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
                     HPEN pen = CreatePen(PS_SOLID, 1, RGB(120, 120, 120));
                     HPEN op = (HPEN)SelectObject(hdc, pen);
                     HGDIOBJ ob = SelectObject(hdc, br);
-                    RoundRect(hdc, b.x + b.w / 2 - 8, b.y + b.h / 2 - 8, b.x + b.w / 2 + 8, b.y + b.h / 2 + 8, 4, 4);
+                    RoundRect(hdc, b.x + b.w / 2 - 7, b.y + b.h / 2 - 7, b.x + b.w / 2 + 7, b.y + b.h / 2 + 7, 4, 4);
                     SelectObject(hdc, op); SelectObject(hdc, ob);
                     DeleteObject(pen); DeleteObject(br);
                 } else if (b.id == IDC_PEN_WIDTH) {
@@ -2740,7 +3208,8 @@ static void RenderToolbar(HDC hdc, RECT& rc) {
                 } else {
                     wchar_t glyph = ICON_BUTTONS[fi].glyph;
                     if (b.id == IDM_RECORD_TOGGLE && g.isRecording) glyph = 0xE71A;
-                    DrawFontIcon(hdc, b.x + b.w / 2, b.y + b.h / 2, glyph, iconColor);
+                    DrawFontIcon(hdc, b.x + b.w / 2, b.y + b.h / 2, glyph, iconColor,
+                                 b.id == IDM_IMAGE_ROT_LEFT);
                 }
                 break;
             }
@@ -3138,7 +3607,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
-        if (g.currentTool == Tool::Crop) {
+        if (g.currentTool == Tool::Crop || g.currentTool == Tool::Pixelate) {
             g.isCropping = true;
             g.cropStart = ip;
             g.cropEnd = ip;
@@ -3175,10 +3644,8 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (g.isPanning) {
             SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
-            T->offsetX += pt.x - g.panLast.x;
-            T->offsetY += pt.y - g.panLast.y;
+            ScrollCanvasBy(g.panLast.x - pt.x, g.panLast.y - pt.y);
             g.panLast = pt;
-            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         if (g.isDraggingSel && T->selIdx >= 0) {
@@ -3273,6 +3740,13 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int y = min(g.cropStart.y, g.cropEnd.y);
             int w = abs(g.cropEnd.x - g.cropStart.x);
             int h = abs(g.cropEnd.y - g.cropStart.y);
+            if (g.currentTool == Tool::Pixelate) {
+                // Stay in pixelate mode so several areas can be hidden in a row.
+                if (w > 2 && h > 2) PixelateRegion(x, y, w, h);
+                RefreshChrome();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (w > 2 && h > 2) {
                 CropImage(x, y, w, h);
             }
@@ -3348,23 +3822,26 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g.isPanning) { g.isPanning = false; ReleaseCapture(); }
         return 0;
 
-case WM_MOUSEWHEEL: {
-        if (!T) return 0;
+    case WM_MOUSEWHEEL: {
+        // Wheel scrolls, Shift+wheel scrolls sideways, Ctrl+wheel zooms at the cursor.
+        if (!T || !T->hasImage) return 0;
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        double oldZ = T->zoom;
-        if (delta > 0) T->zoom *= 1.1;
-        else T->zoom /= 1.1;
-        T->zoom = max(0.02, min(T->zoom, 30.0));
-        POINT pt;
-        GetCursorPos(&pt);
-        ScreenToClient(hwnd, &pt);
-        double mx = (pt.x - T->offsetX) / oldZ;
-        double my = (pt.y - T->offsetY) / oldZ;
-        T->offsetX = pt.x - mx * T->zoom;
-        T->offsetY = pt.y - my * T->zoom;
-        UpdateCanvasScrollBars();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        WORD keys = GET_KEYSTATE_WPARAM(wp);
+        if (keys & MK_CONTROL) {
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            ScreenToClient(hwnd, &pt);
+            ZoomAt(delta > 0 ? T->zoom * 1.1 : T->zoom / 1.1, pt.x, pt.y);
+        } else {
+            int step = -delta * 120 / WHEEL_DELTA;   // 120 px per notch
+            if (keys & MK_SHIFT) ScrollCanvasBy(step, 0);
+            else ScrollCanvasBy(0, step);
+        }
         UpdateStatus();
+        return 0;
+    }
+    case WM_MOUSEHWHEEL: {
+        if (!T || !T->hasImage) return 0;
+        ScrollCanvasBy(GET_WHEEL_DELTA_WPARAM(wp) * 120 / WHEEL_DELTA, 0);
         return 0;
     }
     case WM_HSCROLL: {
@@ -3383,13 +3860,10 @@ case WM_MOUSEWHEEL: {
         case SB_THUMBPOSITION:
         case SB_THUMBTRACK: pos = si.nTrackPos; break;
         case SB_LEFT:       pos = si.nMin; break;
-        case SB_RIGHT:      pos = si.nMax - (int)si.nPage; break;
+        case SB_RIGHT:      pos = si.nMax; break;
         }
-        pos = max(si.nMin, min(pos, si.nMax - (int)si.nPage));
-        t->offsetX = -pos;
-        si.fMask = SIF_POS;
-        si.nPos = pos;
-        SetScrollInfo(hwnd, SB_HORZ, &si, TRUE);
+        t->offsetX = -pos;              // clamped by UpdateCanvasScrollBars
+        UpdateCanvasScrollBars();
         InvalidateRect(hwnd, nullptr, FALSE);
         UpdateStatus();
         return 0;
@@ -3410,13 +3884,10 @@ case WM_MOUSEWHEEL: {
         case SB_THUMBPOSITION:
         case SB_THUMBTRACK: pos = si.nTrackPos; break;
         case SB_TOP:        pos = si.nMin; break;
-        case SB_BOTTOM:     pos = si.nMax - (int)si.nPage; break;
+        case SB_BOTTOM:     pos = si.nMax; break;
         }
-        pos = max(si.nMin, min(pos, si.nMax - (int)si.nPage));
-        t->offsetY = -pos;
-        si.fMask = SIF_POS;
-        si.nPos = pos;
-        SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+        t->offsetY = -pos;              // clamped by UpdateCanvasScrollBars
+        UpdateCanvasScrollBars();
         InvalidateRect(hwnd, nullptr, FALSE);
         UpdateStatus();
         return 0;
@@ -3602,14 +4073,13 @@ g.hwndCanvas = CreateWindowEx(0, L"Static", nullptr,
             WS_CHILD | WS_VISIBLE | WS_HSCROLL | WS_VSCROLL | SS_NOTIFY,
             0, 0, 0, 0, hwnd, (HMENU)IDC_CANVAS, nullptr, nullptr);
         SetWindowLongPtr(g.hwndCanvas, GWLP_WNDPROC, (LONG_PTR)CanvasProc);
+        // Dark scroll bars to match the canvas (ignored on older Windows).
+        SetWindowTheme(g.hwndCanvas, L"DarkMode_Explorer", nullptr);
+        UpdateCanvasScrollBars();
 
         g.hwndMain = hwnd;
 
-        g.hwndTooltip = CreateWindowEx(0, TOOLTIPS_CLASS, nullptr,
-            WS_POPUP | TTS_ALWAYSTIP,
-            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
-        SendMessage(g.hwndTooltip, TTM_SETMAXTIPWIDTH, 0, 300);
+        CreateToolbarTooltip(hwnd);
 
         RebuildToolbar();
 
@@ -3633,7 +4103,8 @@ case WM_SIZE: {
         MoveWindow(g.hwndCanvas, 0, tabY + tabH, rc.right, rc.bottom - tabY - tabH - stH, TRUE);
         SendMessage(g.hStatusbar, WM_SIZE, 0, 0);
         TabData* t = ActiveTab();
-        if (t && t->hasImage) FitToWindow();
+        // Re-fit only if the user hasn't zoomed in/out themselves.
+        if (t && t->hasImage && t->fitMode) FitToWindow();
         UpdateCanvasScrollBars();
         InvalidateRect(hwnd, nullptr, FALSE);
         InvalidateRect(g.hwndCanvas, nullptr, FALSE);
@@ -3672,8 +4143,15 @@ case WM_SIZE: {
                 break;
             }
         }
+        if (!g_trackingLeave) {
+            // Get WM_MOUSELEAVE when the cursor leaves the window or moves onto
+            // a child (canvas, tabs), so the hover and tooltip are cleared.
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            g_trackingLeave = TrackMouseEvent(&tme) != FALSE;
+        }
         if (newH != g.hoverBtn) {
             g.hoverBtn = newH;
+            OnToolbarHoverChanged(newH);
             RECT tr = { 0, 0, 0, g.toolbarH };
             GetClientRect(hwnd, &tr);
             tr.bottom = g.toolbarH;
@@ -3682,7 +4160,34 @@ case WM_SIZE: {
         return 0;
     }
 
+    case WM_MOUSELEAVE: {
+        g_trackingLeave = false;
+        // Windows sometimes reports a leave while the cursor is still over
+        // the toolbar (e.g. when a popup like the tooltip appears). Ignore it.
+        POINT cur;
+        GetCursorPos(&cur);
+        if (WindowFromPoint(cur) == hwnd) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            g_trackingLeave = TrackMouseEvent(&tme) != FALSE;
+            return 0;
+        }
+        HideToolbarTip();
+        if (g.hoverBtn != -1) {
+            g.hoverBtn = -1;
+            RECT tr;
+            GetClientRect(hwnd, &tr);
+            tr.bottom = g.toolbarH;
+            InvalidateRect(hwnd, &tr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_ACTIVATEAPP:
+        if (!wp) HideToolbarTip();
+        break;
+
     case WM_LBUTTONDOWN: {
+        HideToolbarTip();
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         for (size_t i = 0; i < g.tbBtns.size(); i++) {
             const auto& b = g.tbBtns[i];
@@ -3720,6 +4225,8 @@ case WM_SIZE: {
                 T->redoStack.push_back(T->strokes.back());
                 T->strokes.pop_back();
                 T->selIdx = -1;
+            } else if (T) {
+                ImageUndo(T);
             }
             break;
         case IDM_EDIT_REDO:
@@ -3727,7 +4234,37 @@ case WM_SIZE: {
                 T->strokes.push_back(T->redoStack.back());
                 T->redoStack.pop_back();
                 T->selIdx = -1;
+            } else if (T) {
+                ImageRedo(T);
             }
+            break;
+
+        case IDM_IMAGE_MENU: {
+            if (!T || !T->hasImage) break;
+            POINT pt = { 0, g.toolbarH };
+            for (auto& b : g.tbBtns) if (b.id == IDM_IMAGE_MENU) { pt.x = b.x; pt.y = b.y + b.h; }
+            ClientToScreen(hwnd, &pt);
+            ShowImageMenu(hwnd, pt.x, pt.y);
+            break;
+        }
+        case IDM_IMAGE_ROT_LEFT:
+        case IDM_IMAGE_ROT_RIGHT:
+        case IDM_IMAGE_ROT_180:
+        case IDM_IMAGE_FLIP_H:
+        case IDM_IMAGE_FLIP_V:
+        case IDM_IMAGE_GRAYSCALE:
+        case IDM_IMAGE_SEPIA:
+        case IDM_IMAGE_INVERT:
+        case IDM_IMAGE_BLUR:
+        case IDM_IMAGE_SHARPEN:
+        case IDM_IMAGE_BORDER:
+            ApplyImageOp(id);
+            break;
+        case IDM_IMAGE_BRIGHTNESS:
+            ShowBrightnessDlg(hwnd);
+            break;
+        case IDM_TOOL_PIXELATE:
+            if (T && T->hasImage) { g.currentTool = Tool::Pixelate; g.isCropping = false; }
             break;
         case IDM_EDIT_CLEAR:
             if (T) { T->strokes.clear(); T->redoStack.clear(); T->selIdx = -1; }
@@ -3889,16 +4426,13 @@ case WM_SIZE: {
         case IDC_PEN_WIDTH:     ShowPenWidthDlg(hwnd); break;
 
 case IDM_VIEW_ZOOM_IN:
-            if (T) { T->zoom = min(T->zoom * 1.25, 30.0); UpdateCanvasScrollBars(); }
-            InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+            if (T) ZoomAt(T->zoom * 1.25);
             break;
         case IDM_VIEW_ZOOM_OUT:
-            if (T) { T->zoom = max(T->zoom / 1.25, 0.02); UpdateCanvasScrollBars(); }
-            InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+            if (T) ZoomAt(T->zoom / 1.25);
             break;
         case IDM_VIEW_ZOOM_100:
-            if (T) { T->zoom = 1.0; T->offsetX = 0; T->offsetY = 0; UpdateCanvasScrollBars(); }
-            InvalidateRect(g.hwndCanvas, nullptr, FALSE);
+            if (T) ZoomAt(1.0);
             break;
         case IDM_VIEW_FIT:
             if (T && T->hasImage) { FitToWindow(); InvalidateRect(g.hwndCanvas, nullptr, FALSE); }
@@ -3933,6 +4467,8 @@ case IDM_VIEW_ZOOM_IN:
         if (ctrl && wp == 'W') { SendMessage(hwnd, WM_COMMAND, IDM_FILE_CLOSE_TAB, 0); return 0; }
         if (ctrl && wp == 'C') { SendMessage(hwnd, WM_COMMAND, IDM_EDIT_COPY, 0); return 0; }
         if (ctrl && wp == 'V') { SendMessage(hwnd, WM_COMMAND, IDM_EDIT_PASTE, 0); return 0; }
+        if (ctrl && wp == 'R') { SendMessage(hwnd, WM_COMMAND, IDM_IMAGE_ROT_RIGHT, 0); return 0; }
+        if (ctrl && wp == 'L') { SendMessage(hwnd, WM_COMMAND, IDM_IMAGE_ROT_LEFT, 0); return 0; }
         if (wp == VK_F11) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_FULLSCREEN, 0); return 0; }
         if (wp == VK_F12) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_REGION, 0); return 0; }
         if (wp == VK_F10) { SendMessage(hwnd, WM_COMMAND, IDM_CAPTURE_SCROLLING, 0); return 0; }
@@ -4013,6 +4549,11 @@ case IDM_VIEW_ZOOM_IN:
 
     case WM_TIMER:
         if (wp == 3001) { RecordFrame(); return 0; }
+        if (wp == TIP_TIMER_ID) {
+            KillTimer(hwnd, TIP_TIMER_ID);
+            if (g.hoverBtn >= 0) ShowToolbarTip(g.hoverBtn);
+            return 0;
+        }
         break;
 
     case WM_DESTROY:
@@ -4024,7 +4565,7 @@ case IDM_VIEW_ZOOM_IN:
             g.isRecording = false;
         }
         for (auto& tab : g.tabs)
-            if (tab.hBitmap) DeleteObject(tab.hBitmap);
+            { if (tab.hBitmap) DeleteObject(tab.hBitmap); FreeSnaps(tab.imgUndo); FreeSnaps(tab.imgRedo); }
         PostQuitMessage(0);
         return 0;
     }
